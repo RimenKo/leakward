@@ -10,6 +10,7 @@ const { scan, scanGitHistory } = require('../src/scanner');
 // A well-formed but fake AWS Access Key ID — matches SECRET_PATTERNS with no
 // validate() step, so it's a reliable trigger for these throwaway temp repos.
 const FAKE_SECRET = 'AKIAABCDEFGHIJKLMNOP'; // gitleaks:allow — fake fixture, not a real key
+const FAKE_ANTHROPIC_SECRET = ['sk-ant-api03', 'x'.repeat(24)].join('-');
 
 function makeTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'aiguard-scanner-test-'));
@@ -275,14 +276,29 @@ test('npm project, "files" field set without README.md: secret in README.md IS p
   );
 });
 
-// ── npm-confirmed vs git-only: message must name the real leak channel ──
-// A file caught ONLY via the git-tracked-then-later-ignored emulation path
-// (getGitTrackedFiles) really will leak — but through `git push`, since real
-// npm treats .gitignore as pure pattern exclusion and doesn't consult git
-// tracking (verified separately against npm-packlist's own source). Saying
-// "will be published to npm" about a file npm itself excludes is wrong about
-// the channel, even though flagging it at all is correct.
-test('AI secret file (CLAUDE.md) caught only via git-tracking, not confirmed by npm: message names git, not npm', () => {
+// ── CLAUDE.md: scan content, never infer a secret from the filename ─────
+test('safe CLAUDE.md variants are not flagged by filename alone', () => {
+  for (const relFile of ['CLAUDE.md', 'claude.md', '.claude/CLAUDE.md']) {
+    const dir = makeTempProject();
+    initGitRepo(dir);
+    writeFile(dir, relFile, '# Project rules\n\nUse canonical paths from the table.\n');
+    git(dir, ['add', relFile]);
+
+    const findings = scanIsolatedWith(dir, { files: [relFile] });
+    assert.strictEqual(
+      findings.filter((f) => f.file === relFile && f.severity === 'CRITICAL').length,
+      0,
+      `${relFile}: a documentation filename is not evidence that its content contains a secret`
+    );
+    assert.strictEqual(
+      findings.filter((f) => f.file === relFile && f.type === 'ai_secret_file_published').length,
+      0,
+      `${relFile}: documentation must not use the unconditional AI secret-file finding`
+    );
+  }
+});
+
+test('CLAUDE.md with a real secret pattern is still CRITICAL', () => {
   const dir = makeTempProject();
   initGitRepo(dir);
   writeFile(dir, 'package.json', JSON.stringify({ name: 'tmp-pkg-git-only', version: '1.0.0' }));
@@ -294,15 +310,17 @@ test('AI secret file (CLAUDE.md) caught only via git-tracking, not confirmed by 
   writeFile(dir, '.gitignore', 'CLAUDE.md\n');
 
   const findings = scanIsolated(dir);
-  const published = findings.filter((f) => f.type === 'ai_secret_file_published' && f.file === 'CLAUDE.md');
-  assert.strictEqual(published.length, 1, 'must still flag CLAUDE.md — it really does leak, just via git, not npm');
-  assert.match(
-    published[0].detail, /git push/,
-    'message must name the actual leak channel (git push), not "уйдёт в npm-пакет" — real npm excludes this file'
+  const secretPatterns = findingsFor(findings, 'CLAUDE.md');
+  assert.strictEqual(secretPatterns.length, 1, 'the AWS key inside CLAUDE.md must still be reported');
+  assert.strictEqual(
+    secretPatterns[0].severity,
+    'CRITICAL',
+    'content matches in high-risk documentation must remain CRITICAL'
   );
-  assert.doesNotMatch(
-    published[0].detail, /уйдёт в npm-пакет/,
-    'must not claim npm will publish a file npm pack itself confirmed it excludes'
+  assert.strictEqual(
+    findings.filter((f) => f.type === 'ai_secret_file_published' && f.file === 'CLAUDE.md').length,
+    0,
+    'the finding must come from scanned content, not the filename'
   );
 });
 
@@ -606,6 +624,17 @@ test('file over the size limit is skipped without scanning (fast, and a WARN nam
   assert.strictEqual(tooLarge[0].severity, 'WARN');
 });
 
+test('oversized CLAUDE.md blocks without falsely claiming that a secret was found', () => {
+  const dir = makeTempProject();
+  writeFile(dir, 'CLAUDE.md', 'a'.repeat(6 * 1024 * 1024));
+
+  const findings = scanIsolated(dir);
+  const incomplete = findings.filter((f) => f.type === 'content_scan_incomplete' && f.file === 'CLAUDE.md');
+  assert.strictEqual(incomplete.length, 1, 'an unscanned high-risk document must block instead of silently degrading to WARN');
+  assert.strictEqual(incomplete[0].severity, 'HIGH');
+  assert.doesNotMatch(incomplete[0].detail, /содержит API-ключи/, 'unknown content must not be described as a confirmed secret');
+});
+
 // ── UTF-16: BOM'd text must be decoded and scanned, not treated as binary ──
 test('UTF-16 LE file (with BOM) is scanned as text, not skipped as binary', () => {
   const dir = makeTempProject();
@@ -872,6 +901,32 @@ test('EMFILE (or any non-permission read error) on an existing file emits file_u
   assert.strictEqual(findingsFor(findings, 'emfile.js').length, 0, 'no secret_pattern finding expected — content was never actually read');
 });
 
+test('unreadable CLAUDE.md blocks because its content could not be checked', () => {
+  const dir = makeTempProject();
+  writeFile(dir, 'CLAUDE.md', '# Project rules\n');
+  const target = fs.realpathSync(path.join(dir, 'CLAUDE.md'));
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function (p, ...rest) {
+    if (p === target) {
+      const err = new Error('simulated EIO');
+      err.code = 'EIO';
+      throw err;
+    }
+    return originalReadFileSync.call(fs, p, ...rest);
+  };
+
+  let findings;
+  try {
+    findings = scanIsolated(dir);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+
+  const incomplete = findings.filter((f) => f.type === 'content_scan_incomplete' && f.file === 'CLAUDE.md');
+  assert.strictEqual(incomplete.length, 1, 'an unreadable high-risk document must not pass with WARN only');
+  assert.strictEqual(incomplete[0].severity, 'HIGH');
+});
+
 // ── BIP39 seed: HIGH regardless of separator (JSON/comma/space) ──────────
 // Same 12 scrambled BIP39 words used in patterns.test.js — confirmed to
 // trigger the BIP39 mnemonic pattern (non-canonical order, ≥90% in dict).
@@ -1084,6 +1139,129 @@ test('CLI: aiguard.js --staged flags a secret in a staged file but not one that 
     !output.includes('unstaged-leak.js'),
     '--staged output must NOT mention the unstaged-but-tracked file, even though a normal scan would find it'
   );
+});
+
+test('CLI: every staged CLAUDE.md variant passes when safe and catches a secret from index despite a working-tree symlink', () => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cliPaths = ['aiguard.js', 'leakward.js'].map((bin) => path.join(__dirname, '..', 'bin', bin));
+  for (const relFile of ['CLAUDE.md', 'claude.md', '.claude/CLAUDE.md']) {
+    const dir = makeTempProject();
+    initGitRepo(dir);
+    writeFile(dir, relFile, '# Project rules\n\nUse canonical paths from the table.\n');
+    git(dir, ['add', relFile]);
+
+    for (const cli of cliPaths) {
+      const safeOutput = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+      assert.ok(safeOutput.includes('Всё чисто'), `${path.basename(cli)}: safe staged ${relFile} must pass`);
+    }
+
+    writeFile(dir, relFile, `# Project rules\n\nAPI key: ${FAKE_ANTHROPIC_SECRET}\n`);
+    git(dir, ['add', relFile]);
+    const full = path.join(dir, relFile);
+    const safeTarget = `${full}.safe`;
+    fs.writeFileSync(safeTarget, '# Safe working-tree target\n');
+    fs.unlinkSync(full);
+    fs.symlinkSync(path.basename(safeTarget), full);
+
+    for (const cli of cliPaths) {
+      let status = 0;
+      let output = '';
+      try {
+        output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+      } catch (err) {
+        status = err.status;
+        output = err.stdout || '';
+      }
+      assert.strictEqual(status, 1, `${path.basename(cli)}: staged ${relFile} secret must block despite a working-tree symlink`);
+      assert.ok(output.includes('КРИТИЧНО'), `${path.basename(cli)}: ${relFile} content match must be CRITICAL`);
+      assert.ok(output.includes(relFile), `${path.basename(cli)}: critical output must name ${relFile}`);
+    }
+  }
+});
+
+test('CLI: staged non-sensitive binary and oversized files keep their previous non-blocking behavior', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  fs.writeFileSync(path.join(dir, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]));
+  writeFile(dir, 'large.txt', 'a'.repeat(6 * 1024 * 1024));
+  git(dir, ['add', 'image.png', 'large.txt']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('РЕКОМЕНДАЦИИ'), 'oversized non-sensitive staged file may warn but must not block');
+  assert.ok(!output.includes('публикация заблокирована'), 'ordinary binary/large staged files must not become blocking findings');
+});
+
+test('CLI: staged type change from symlink to secret CLAUDE.md is scanned and blocked', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'safe.md', '# Safe target\n');
+  fs.symlinkSync('safe.md', path.join(dir, 'CLAUDE.md'));
+  git(dir, ['add', 'safe.md', 'CLAUDE.md']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline symlink']);
+
+  fs.unlinkSync(path.join(dir, 'CLAUDE.md'));
+  writeFile(dir, 'CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'CLAUDE.md']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'a staged type-change secret must not disappear from --staged');
+  assert.ok(output.includes('КРИТИЧНО'));
+});
+
+test('CLI: unstaged ignore rule cannot hide a staged CLAUDE.md secret', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'CLAUDE.md']);
+  writeFile(dir, '.leakwardignore', 'CLAUDE.md\n');
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  try {
+    execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+  }
+  assert.strictEqual(status, 1, 'only ignore rules present in the index may affect a staged scan');
+});
+
+test('CLI: nested project root scans relative staged paths and ignores staged files outside that root', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'project/CLAUDE.md', '# Safe nested project rules\n');
+  writeFile(dir, 'outside.js', `const key = "${FAKE_SECRET}";\n`);
+  git(dir, ['add', 'project/CLAUDE.md', 'outside.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const projectRoot = path.join(dir, 'project');
+  const safeOutput = execFileSync(process.execPath, [cli, projectRoot, '--staged'], { encoding: 'utf8', env });
+  assert.ok(safeOutput.includes('Всё чисто'), 'outside-root staged secret must not contaminate the nested project scan');
+
+  writeFile(dir, 'project/CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'project/CLAUDE.md']);
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, projectRoot, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'nested project CLAUDE.md secret must block');
+  assert.ok(output.includes('КРИТИЧНО'), 'nested project CLAUDE.md keeps the sensitive-path severity');
 });
 
 // ── aiguard:allow + .aiguardignore (false-positive suppression) ──

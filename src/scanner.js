@@ -2,8 +2,24 @@
 
 const fs = require('fs');
 const path = require('path');
-const { AI_FOLDERS, AI_SECRET_FILES, SECRET_PATTERNS } = require('./patterns');
-const { matchIsAllowed, loadIgnoreRules, isPathIgnored, isIgnoreFilename } = require('./allow');
+const {
+  AI_FOLDERS,
+  AI_SECRET_FILES,
+  AI_CONTENT_SENSITIVE_FILES,
+  SECRET_PATTERNS,
+} = require('./patterns');
+const {
+  IGNORE_FILENAMES,
+  matchIsAllowed,
+  parseIgnoreRules,
+  loadIgnoreRules,
+  isPathIgnored,
+  isIgnoreFilename,
+} = require('./allow');
+
+function toPosixPath(value) {
+  return String(value).split(/[\\/]/).join('/');
+}
 
 /**
  * Returns list of files that will be included in npm publish.
@@ -80,7 +96,8 @@ function isGitRepo(projectRoot) {
 // real `git push` would, and a file committed before a later .gitignore rule
 // excluded it stays tracked (git never re-applies ignore rules
 // retroactively) — both cases a hand-rolled ignore-file parser gets wrong.
-// Paths are normalized to path.sep — git always prints '/'.
+// Paths stay POSIX-normalized — git always prints '/', and keeping one
+// representation avoids Windows-only mismatches in staged/include checks.
 function getGitTrackedFiles(projectRoot) {
   const { execFileSync } = require('child_process');
   try {
@@ -88,7 +105,7 @@ function getGitTrackedFiles(projectRoot) {
       'git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
       { cwd: projectRoot, stdio: 'pipe', maxBuffer: 50 * 1024 * 1024, timeout: GIT_COMMAND_TIMEOUT_MS }
     ).toString('utf8');
-    return output.split('\0').filter(Boolean).map((p) => p.split('/').join(path.sep));
+    return output.split('\0').filter(Boolean).map(toPosixPath);
   } catch (_) {
     return null;
   }
@@ -106,9 +123,8 @@ function getGitTrackedFiles(projectRoot) {
 // running scripts). A secret scanner has no business executing arbitrary
 // code from the project it's supposed to be passively reading.
 //
-// Paths come back npm-normalized with '/' separators; converted to path.sep
-// to compare equal with the rest of this file's path.relative()-produced
-// paths (same reasoning as getGitTrackedFiles() above).
+// Paths come back npm-normalized with '/' separators and stay that way so
+// every source uses the same representation on every platform.
 //
 // `errorDetail`, if passed, gets npm's own one-line explanation pushed onto
 // it on failure (e.g. "code EJSONPARSE" for a broken package.json) — so the
@@ -149,7 +165,7 @@ function getNpmPackFiles(projectRoot, errorDetail) {
 
   return manifest.files
     .filter((f) => f && typeof f.path === 'string')
-    .map((f) => f.path.split('/').join(path.sep));
+    .map((f) => toPosixPath(f.path));
 }
 
 // Wraps getGitTrackedFiles() with the one filter that isn't about exclusion
@@ -201,17 +217,19 @@ function getGitFileList(projectRoot, warnings) {
 // committed" on every commit, not a full publish/tracked-tree scan each
 // time — that full scan was slow and noisy enough that aiguard was never
 // actually wired into pre-commit despite existing for this exact purpose.
-// --diff-filter=ACMR drops deleted files (D) — nothing to scan in a file
-// being removed — and keeps renames (R) so a renamed file's content still
-// gets scanned even when the rename alone carries no other diff.
+// --diff-filter=ACMRT drops deleted files (D) — nothing to scan in a file
+// being removed — and keeps renames (R) plus type changes (T), e.g. a
+// committed symlink replaced by a regular file containing a secret.
+// --relative + pathspec '.' keep results relative to projectRoot even when
+// it is a nested directory inside a larger repository.
 function getStagedFiles(projectRoot) {
   const { execFileSync } = require('child_process');
   try {
     const output = execFileSync(
-      'git', ['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'],
+      'git', ['diff', '--cached', '--name-only', '--diff-filter=ACMRT', '--relative', '-z', '--', '.'],
       { cwd: projectRoot, stdio: 'pipe', maxBuffer: 50 * 1024 * 1024, timeout: GIT_COMMAND_TIMEOUT_MS }
     ).toString('utf8');
-    return output.split('\0').filter(Boolean).map((p) => p.split('/').join(path.sep));
+    return output.split('\0').filter(Boolean).map(toPosixPath);
   } catch (_) {
     return null;
   }
@@ -357,8 +375,8 @@ function getPublishFiles(projectRoot, gitWarnings, npmWarnings, npmConfirmed, wa
     // form: git normalizes to NFC, but fs.readdirSync() (used by
     // walkAllFiles) can return NFD for the same name — common on macOS for
     // names with combining accents (e.g. "café.js").
-    const merged = new Set(gitFiles.map((f) => f.normalize('NFC')));
-    for (const f of fallbackFiles) merged.add(f.normalize('NFC'));
+    const merged = new Set(gitFiles.map((f) => toPosixPath(f).normalize('NFC')));
+    for (const f of fallbackFiles) merged.add(toPosixPath(f).normalize('NFC'));
     return Array.from(merged);
   }
 
@@ -409,6 +427,7 @@ function scan(projectRoot, options) {
     const gitFiles = getGitFileList(projectRoot, gitWarnings);
     publishFiles = gitFiles !== null ? gitFiles : walkAllFiles(projectRoot, walkWarnings);
   }
+  publishFiles = publishFiles.map(toPosixPath);
 
   // options.files restricts scanning to an explicit list (used by --staged:
   // a git hook wants "scan exactly what's about to be committed", not the
@@ -426,9 +445,13 @@ function scan(projectRoot, options) {
   // and silently filtered out every file (caught by a test, not manually).
   if (options.files) {
     const wanted = new Set(
-      options.files.map((f) => path.relative(projectRoot, path.resolve(projectRoot, f)).split(path.sep).join('/'))
+      options.files.map((f) => toPosixPath(path.relative(projectRoot, path.resolve(projectRoot, f))))
     );
-    publishFiles = publishFiles.filter((f) => wanted.has(f));
+    if (options.staged) {
+      publishFiles = Array.from(wanted).filter((f) => f && f !== '..' && !f.startsWith('../'));
+    } else {
+      publishFiles = publishFiles.filter((f) => wanted.has(f));
+    }
   }
 
   // .leakwardignore / .aiguardignore at the scan root — gitignore-style
@@ -437,10 +460,10 @@ function scan(projectRoot, options) {
   // file findings. Applied after options.files so an explicit --staged path
   // is still skippable: the ignore file is a pinpoint "do not scan this"
   // switch, not something --staged should override.
-  const ignoreRules = loadIgnoreRules(projectRoot);
+  const ignoreRules = options.staged ? loadStagedIgnoreRules(projectRoot) : loadIgnoreRules(projectRoot);
   if (ignoreRules.length) {
     publishFiles = publishFiles.filter((f) => {
-      const posix = String(f).split(/[\\/]/).join('/');
+      const posix = toPosixPath(f);
       if (isIgnoreFilename(posix)) return true;
       return !isPathIgnored(f, ignoreRules);
     });
@@ -481,7 +504,10 @@ function scan(projectRoot, options) {
 
   // 1. Check for AI tool folders in published files
   for (const aiFolder of AI_FOLDERS) {
-    const inPublish = publishFiles.filter(f => f.startsWith(aiFolder + '/') || f === aiFolder);
+    const inPublish = publishFiles.filter((f) => {
+      const inFolder = f.startsWith(aiFolder + '/') || f === aiFolder;
+      return inFolder && !AI_CONTENT_SENSITIVE_FILES.includes(f);
+    });
     if (inPublish.length > 0) {
       // npm pack succeeded but confirms only SOME (or none) of these paths →
       // the rest are only here via the git-sourced half of the union — could
@@ -592,42 +618,50 @@ function scan(projectRoot, options) {
   for (const relFile of publishFiles) {
     if (AI_SECRET_FILES.includes(relFile)) continue;
 
-    const full = resolveWithinRoot(projectRoot, relFile);
-    if (!full) continue; // defense in depth — publishFiles should already be root-safe
-
-    const fileSize = getFileSize(full);
-    if (fileSize !== null && fileSize > MAX_FILE_SIZE_BYTES) {
-      findings.push({
-        severity: 'WARN',
-        type: 'file_too_large',
-        file: relFile,
-        detail: `Файл ${(fileSize / (1024 * 1024)).toFixed(1)} МБ — больше лимита в ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} МБ, пропущен без сканирования. Секреты внутри (если есть) не проверены.`,
-      });
-      continue;
+    const contentSensitive = AI_CONTENT_SENSITIVE_FILES.includes(relFile);
+    let content;
+    let fileSize;
+    if (options.staged) {
+      content = safeReadStaged(projectRoot, relFile);
+    } else {
+      const full = resolveWithinRoot(projectRoot, relFile);
+      if (!full) continue; // defense in depth — publishFiles should already be root-safe
+      fileSize = getFileSize(full);
+      if (fileSize === null) {
+        if (!fs.existsSync(full)) continue; // normal race: file disappeared after listing
+        content = UNREADABLE;
+      } else if (fileSize > MAX_FILE_SIZE_BYTES) {
+        content = TOO_LARGE;
+      } else {
+        content = safeRead(full, fileSize);
+      }
     }
-    // stat failed — either a race (file disappeared between listing and
-    // scanning, which is normal and harmless) or a real access problem.
-    // Distinguish by checking whether the file still exists: if it does, we
-    // know the scan gap is real and must say so; if it's gone, stay silent.
-    if (fileSize === null) {
-      if (fs.existsSync(full)) {
-        findings.push(fileUnreadableFinding(relFile));
+
+    if (content === TOO_LARGE) {
+      findings.push(fileTooLargeFinding(relFile, 'пропущен без сканирования', fileSize));
+      if (contentSensitive) {
+        findings.push(unscannedBlockingFinding(relFile, 'содержимое документа повышенного риска превышает лимит сканера'));
       }
       continue;
     }
-
-    const content = safeRead(full, fileSize);
-    // safeRead returns UNREADABLE (not null) when readFileSync throws
-    // EACCES/EPERM — stat succeeded (file is there, size is known) but the
-    // process has no read permission. Must warn explicitly rather than
-    // silently skip, or a chmod-000 file containing a secret goes undetected.
     if (content === UNREADABLE) {
       findings.push(fileUnreadableFinding(relFile));
+      if (contentSensitive) {
+        const source = options.staged ? 'git index' : 'документа повышенного риска';
+        findings.push(unscannedBlockingFinding(relFile, `не удалось проверить содержимое из ${source}`));
+      }
+      continue;
+    }
+    if (content === null) {
+      if (contentSensitive) {
+        findings.push(unscannedBlockingFinding(relFile, 'содержимое документа повышенного риска определено как бинарное'));
+      }
       continue;
     }
     if (!content) continue;
 
-    findings.push(...scanContent(relFile, content, 'HIGH'));
+    const severity = contentSensitive ? 'CRITICAL' : 'HIGH';
+    findings.push(...scanContent(relFile, content, severity));
   }
 
   // 4. Check .npmignore is missing AI folders (npm projects only)
@@ -717,6 +751,28 @@ const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
 // visible file_unreadable warning instead of silently skipping the file —
 // the same principle as directory_unreadable for folders.
 const UNREADABLE = Symbol('file_unreadable');
+const TOO_LARGE = Symbol('file_too_large');
+
+function fileTooLargeFinding(file, action, size) {
+  const measured = size === undefined
+    ? `Файл больше лимита в ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} МБ`
+    : `Файл ${(size / (1024 * 1024)).toFixed(1)} МБ — больше лимита в ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} МБ`;
+  return {
+    severity: 'WARN',
+    type: 'file_too_large',
+    file,
+    detail: `${measured}, ${action}. Секреты внутри (если есть) не проверены.`,
+  };
+}
+
+function unscannedBlockingFinding(file, reason) {
+  return {
+    severity: 'HIGH',
+    type: 'content_scan_incomplete',
+    file,
+    detail: `Проверка заблокирована: ${reason}. Сканер не может подтвердить отсутствие секретов.`,
+  };
+}
 
 // Builds the standard file_unreadable finding so all four callers in scan()
 // produce exactly the same shape and text — avoids silent divergence if the
@@ -774,6 +830,51 @@ function safeRead(filePath, knownSize) {
     if (err.code === 'ENOENT' && !fs.existsSync(filePath)) return null;
     return UNREADABLE;
   }
+}
+
+// Reads the blob that is actually staged, not the working-tree file. A user
+// can stage a secret and then clean only the working copy; scanning by path
+// alone would otherwise approve content different from the pending commit.
+function safeReadStaged(projectRoot, relPath) {
+  const { execFileSync } = require('child_process');
+  const object = `:./${toPosixPath(relPath)}`;
+  let size;
+  try {
+    const output = execFileSync('git', ['cat-file', '-s', object], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: 1024 * 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    }).toString('utf8').trim();
+    size = Number(output);
+  } catch (_) {
+    return UNREADABLE;
+  }
+  if (!Number.isSafeInteger(size) || size < 0) return UNREADABLE;
+  if (size > MAX_FILE_SIZE_BYTES) return TOO_LARGE;
+
+  try {
+    const buf = execFileSync('git', ['show', object], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: MAX_FILE_SIZE_BYTES + 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    const bom = detectUtf16Bom(buf);
+    if (!bom && isBinaryBuffer(buf)) return null;
+    return decodeText(buf, bom);
+  } catch (_) {
+    return UNREADABLE;
+  }
+}
+
+function loadStagedIgnoreRules(projectRoot) {
+  const rules = [];
+  for (const name of IGNORE_FILENAMES) {
+    const content = safeReadStaged(projectRoot, name);
+    if (typeof content === 'string') rules.push(...parseIgnoreRules(content));
+  }
+  return rules;
 }
 
 // A UTF-16 BOM (0xFF 0xFE little-endian, 0xFE 0xFF big-endian) is the one

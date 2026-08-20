@@ -81,6 +81,7 @@ try {
       process.exit(1);
     }
     scanOptions.files = staged;
+    scanOptions.staged = true;
   }
   findings = scan(projectRoot, scanOptions);
   if (historyMode) {

@@ -65,6 +65,12 @@ const AI_SECRET_FILES = [
   '.claude/settings.local.json',
   '.cursor/mcp.json',
   '.cursor/settings.json',
+];
+
+// Documentation files frequently contain pasted credentials, but their name
+// alone is not evidence of a leak. Scan their contents like any other file;
+// only real pattern matches are escalated to CRITICAL.
+const AI_CONTENT_SENSITIVE_FILES = [
   // CLAUDE.md is the #1 leak source in public repos:
   // our research found 138 secrets across 362 GitHub files,
   // 63+ in CLAUDE.md variants alone — devs paste secrets into context files
@@ -285,4 +291,4 @@ const SECRET_PATTERNS = [
   },
 ];
 
-module.exports = { AI_FOLDERS, AI_SECRET_FILES, SECRET_PATTERNS };
+module.exports = { AI_FOLDERS, AI_SECRET_FILES, AI_CONTENT_SENSITIVE_FILES, SECRET_PATTERNS };
