@@ -991,6 +991,14 @@ test('CLI: aiguard.js --npm-only exits 0 when the only secret is in a file npm "
   }
   assert.strictEqual(npmOnlyStatus, 0, '--npm-only must exit 0 — the fixture secret is not npm-published');
 
+  let leakwardNpmOnlyStatus = 0;
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'leakward.js'), dir, '--npm-only'], { encoding: 'utf8', env });
+  } catch (err) {
+    leakwardNpmOnlyStatus = err.status;
+  }
+  assert.strictEqual(leakwardNpmOnlyStatus, 0, 'public leakward.js --npm-only must match aiguard.js (exit 0)');
+
   let normalStatus = 0;
   try {
     execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'aiguard.js'), dir], { encoding: 'utf8', env });

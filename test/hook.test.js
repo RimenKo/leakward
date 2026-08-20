@@ -6,7 +6,8 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const HOOK = path.join(__dirname, '..', 'claude-hook', 'aiguard-hook.js');
+const HOOK = path.join(__dirname, '..', 'claude-hook', 'leakward-hook.js');
+const LEGACY_HOOK = path.join(__dirname, '..', 'claude-hook', 'aiguard-hook.js');
 
 function runHook(toolInput, extra) {
   return spawnSync(process.execPath, [HOOK], {
@@ -405,6 +406,26 @@ check(
     `[Write: .leakwardignore itself] expected exit 2 (ignore file is never skipped), got ${r2.status}\nstderr: ${r2.stderr}`
   );
   console.log('✓ Write: .leakwardignore itself is still scanned (never self-ignored)');
+  passed++;
+}
+
+{
+  const r = spawnSync(process.execPath, [LEGACY_HOOK], {
+    input: JSON.stringify({ tool_input: { file_path: 'env.js', content: `key = ${AWS_HOOK_FIXTURE}` } }),
+    encoding: 'utf8',
+  });
+  assert.strictEqual(r.status, 2, `legacy aiguard-hook.js must still block, got ${r.status}\nstderr: ${r.stderr}`);
+  console.log('✓ Write via deprecated aiguard-hook.js path still blocks');
+  passed++;
+}
+
+{
+  const r = spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify({ tool_input: { file_path: 'env.js', content: `key = ${AWS_HOOK_FIXTURE} // leakward:allow` } }),
+    encoding: 'utf8',
+  });
+  assert.strictEqual(r.status, 0, `public leakward-hook.js must honor leakward:allow, got ${r.status}\nstderr: ${r.stderr}`);
+  console.log('✓ Write via public leakward-hook.js honors leakward:allow');
   passed++;
 }
 

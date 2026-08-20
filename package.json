@@ -1,6 +1,6 @@
 {
   "name": "@rimenko-dev/leakward",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Protect your projects from AI-tool secret leaks — catches .claude/, .cursor/, and hidden credentials before npm publish or git push",
   "keywords": [
     "leakward", "security", "secrets", "claude-code", "cursor", "ai", "leak", "npm-publish", "api-key"
@@ -20,7 +20,7 @@
     "aiguard": "bin/leakward.js"
   },
   "scripts": {
-    "test": "node test/patterns.test.js && node test/scanner.test.js && node test/hook.test.js",
+    "test": "node test/patterns.test.js && node test/scanner.test.js && node test/hook.test.js && node test/resolve-hook-path.test.js",
     "prepublishOnly": "node bin/leakward.js --npm-only"
   },
   "files": [
