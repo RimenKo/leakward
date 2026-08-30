@@ -103,12 +103,17 @@ leakward
 # Scan a specific project
 leakward /path/to/project
 
+# Scan only files staged for commit (pre-commit / --staged hook path)
+leakward --staged
+
 # Scan git history for past leaks
 leakward --history
 
 # Combine both
 leakward /path/to/project --history
 ```
+
+`--staged` scans the git index only. Local gitignored `CLAUDE.md` files are not part of that pending commit, so their excluded-content WARN path does not run in `--staged` mode.
 
 **Exit codes:**
 - `0` — clean or warnings only

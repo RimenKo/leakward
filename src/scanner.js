@@ -433,18 +433,21 @@ function scan(projectRoot, options) {
   const npmConfirmedFiles = new Set();
   const walkWarnings = [];
   let publishFiles;
-  if (isNpmProject) {
+  // --staged only scans the explicit index paths. Skip npm pack / full-tree
+  // discovery here — that cost is what made pre-commit too slow to wire in.
+  if (options.staged && options.files) {
+    publishFiles = options.files
+      .map((f) => toPosixPath(path.relative(projectRoot, path.resolve(projectRoot, f))))
+      .filter((f) => f && f !== '..' && !f.startsWith('../'));
+  } else if (isNpmProject) {
     publishFiles = getPublishFiles(projectRoot, gitWarnings, npmWarnings, npmConfirmedFiles, walkWarnings, npmOnly);
+    publishFiles = publishFiles.map(toPosixPath);
   } else {
     const gitFiles = getGitFileList(projectRoot, gitWarnings);
-    publishFiles = gitFiles !== null ? gitFiles : walkAllFiles(projectRoot, walkWarnings);
+    publishFiles = (gitFiles !== null ? gitFiles : walkAllFiles(projectRoot, walkWarnings)).map(toPosixPath);
   }
-  publishFiles = publishFiles.map(toPosixPath);
 
-  // options.files restricts scanning to an explicit list (used by --staged:
-  // a git hook wants "scan exactly what's about to be committed", not the
-  // full npm-publish/git-tracked set — running the full scan on every commit
-  // is what made the tool too slow/noisy to wire into pre-commit at all).
+  // options.files restricts scanning to an explicit list (non-staged callers).
   // Accepts absolute paths or paths relative to CWD; normalized to the same
   // root-relative POSIX form publishFiles already uses (git ls-files' own
   // format), so the AI-folder/secret-file/content-scan logic below needs no
@@ -455,15 +458,11 @@ function scan(projectRoot, options) {
   // publishFiles' own entries came from git/npm run with cwd=projectRoot —
   // realpath-ing just this side of the comparison made every path mismatch
   // and silently filtered out every file (caught by a test, not manually).
-  if (options.files) {
+  if (options.files && !options.staged) {
     const wanted = new Set(
       options.files.map((f) => toPosixPath(path.relative(projectRoot, path.resolve(projectRoot, f))))
     );
-    if (options.staged) {
-      publishFiles = Array.from(wanted).filter((f) => f && f !== '..' && !f.startsWith('../'));
-    } else {
-      publishFiles = publishFiles.filter((f) => wanted.has(f));
-    }
+    publishFiles = publishFiles.filter((f) => wanted.has(f));
   }
 
   // .leakwardignore / .aiguardignore at the scan root — gitignore-style
@@ -796,6 +795,57 @@ function unscannedBlockingFinding(file, reason) {
   };
 }
 
+function listShallowContentSensitiveFiles(projectRoot) {
+  const found = [];
+  const basenames = AI_CONTENT_SENSITIVE_FILES
+    .filter((entry) => !entry.includes('/'))
+    .map((entry) => entry.toLowerCase());
+  const uniqueBasenames = Array.from(new Set(basenames));
+
+  let entries;
+  try {
+    entries = fs.readdirSync(projectRoot);
+  } catch (_) {
+    return found;
+  }
+
+  for (const name of entries) {
+    if (name === 'node_modules' || name === '.git') continue;
+    const full = path.join(projectRoot, name);
+    let stat;
+    try {
+      stat = fs.lstatSync(full);
+    } catch (_) {
+      continue;
+    }
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isFile() && isContentSensitiveFile(name)) {
+      found.push(toPosixPath(name));
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    let children;
+    try {
+      children = fs.readdirSync(full);
+    } catch (_) {
+      continue;
+    }
+    for (const child of children) {
+      if (!uniqueBasenames.includes(child.toLowerCase())) continue;
+      const childRel = toPosixPath(path.join(name, child));
+      if (!isContentSensitiveFile(childRel)) continue;
+      let childStat;
+      try {
+        childStat = fs.lstatSync(path.join(full, child));
+      } catch (_) {
+        continue;
+      }
+      if (childStat.isFile() && !childStat.isSymbolicLink()) found.push(childRel);
+    }
+  }
+  return found;
+}
+
 function scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRules) {
   const findings = [];
   const seenFiles = new Set();
@@ -811,12 +861,11 @@ function scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRule
     } catch (_) {}
   }
 
-  // Exact list plus nested basename matches discovered on disk (e.g. a
-  // gitignored docs/CLAUDE.md that never entered publishFiles).
+  // Exact list plus shallow nested basename matches (e.g. gitignored
+  // docs/CLAUDE.md). Avoid a full-tree walk — only root + one directory level.
   const candidates = new Set(AI_CONTENT_SENSITIVE_FILES.map(toPosixPath));
-  for (const relFile of walkAllFiles(projectRoot) || []) {
-    const posix = toPosixPath(relFile);
-    if (isContentSensitiveFile(posix)) candidates.add(posix);
+  for (const relFile of listShallowContentSensitiveFiles(projectRoot)) {
+    candidates.add(relFile);
   }
 
   for (const relFile of candidates) {

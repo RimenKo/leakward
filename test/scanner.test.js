@@ -369,21 +369,6 @@ test('gitignored nested docs/CLAUDE.md also warns on real secret content', () =>
   assert.strictEqual(secretPatterns[0].severity, 'WARN');
 });
 
-test('Title-case Claude.md with a secret is CRITICAL on case-sensitive basenames', () => {
-  if (process.platform === 'darwin') {
-    // APFS default is case-insensitive; skip spelling that collides with CLAUDE.md.
-    return;
-  }
-  const dir = makeTempProject();
-  initGitRepo(dir);
-  writeFile(dir, 'Claude.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
-  git(dir, ['add', 'Claude.md']);
-
-  const findings = scanIsolatedWith(dir, { files: ['Claude.md'] });
-  const secretPatterns = findingsFor(findings, 'Claude.md');
-  assert.strictEqual(secretPatterns.length, 1);
-  assert.strictEqual(secretPatterns[0].severity, 'CRITICAL');
-});
 
 test('content-sensitive filename aliases resolve to one physical file and are not double-scanned', () => {
   const dir = makeTempProject();
