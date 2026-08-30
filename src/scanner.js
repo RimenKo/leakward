@@ -18,7 +18,8 @@ const {
 } = require('./allow');
 
 function toPosixPath(value) {
-  return String(value).split(/[\\/]/).join('/');
+  const text = String(value);
+  return path.sep === '\\' ? text.split('\\').join('/') : text;
 }
 
 /**
@@ -646,12 +647,13 @@ function scan(projectRoot, options) {
     }
     if (content === UNREADABLE) {
       findings.push(fileUnreadableFinding(relFile));
-      if (contentSensitive) {
+      if (options.staged || contentSensitive) {
         const source = options.staged ? 'git index' : 'документа повышенного риска';
         findings.push(unscannedBlockingFinding(relFile, `не удалось проверить содержимое из ${source}`));
       }
       continue;
     }
+    if (content === NON_BLOB) continue;
     if (content === null) {
       if (contentSensitive) {
         findings.push(unscannedBlockingFinding(relFile, 'содержимое документа повышенного риска определено как бинарное'));
@@ -662,6 +664,14 @@ function scan(projectRoot, options) {
 
     const severity = contentSensitive ? 'CRITICAL' : 'HIGH';
     findings.push(...scanContent(relFile, content, severity));
+  }
+
+  // A locally ignored CLAUDE.md is not part of the pending publish/commit,
+  // so its filename alone must stay silent. Still scan real content matches
+  // at WARN: this preserves the old early warning for credentials pasted
+  // into local context without reintroducing an unconditional block.
+  if (!options.files) {
+    findings.push(...scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRules));
   }
 
   // 4. Check .npmignore is missing AI folders (npm projects only)
@@ -752,6 +762,7 @@ const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
 // the same principle as directory_unreadable for folders.
 const UNREADABLE = Symbol('file_unreadable');
 const TOO_LARGE = Symbol('file_too_large');
+const NON_BLOB = Symbol('non_blob_index_entry');
 
 function fileTooLargeFinding(file, action, size) {
   const measured = size === undefined
@@ -772,6 +783,55 @@ function unscannedBlockingFinding(file, reason) {
     file,
     detail: `Проверка заблокирована: ${reason}. Сканер не может подтвердить отсутствие секретов.`,
   };
+}
+
+function scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRules) {
+  const findings = [];
+  const seenFiles = new Set();
+  for (const relFile of AI_CONTENT_SENSITIVE_FILES) {
+    if (!publishFiles.includes(relFile)) continue;
+    const full = resolveWithinRoot(projectRoot, relFile);
+    if (!full) continue;
+    try {
+      const stat = fs.statSync(full);
+      seenFiles.add(`${stat.dev}:${stat.ino}`);
+    } catch (_) {}
+  }
+
+  for (const relFile of AI_CONTENT_SENSITIVE_FILES) {
+    if (publishFiles.includes(relFile)) continue;
+    if (ignoreRules.length && isPathIgnored(relFile, ignoreRules)) continue;
+
+    const full = resolveWithinRoot(projectRoot, relFile);
+    if (!full || !fs.existsSync(full)) continue;
+    let fileIdentity;
+    try {
+      const stat = fs.statSync(full);
+      fileIdentity = `${stat.dev}:${stat.ino}`;
+    } catch (_) {
+      fileIdentity = full;
+    }
+    if (seenFiles.has(fileIdentity)) continue;
+    seenFiles.add(fileIdentity);
+
+    const fileSize = getFileSize(full);
+    if (fileSize === null) {
+      findings.push(fileUnreadableFinding(relFile));
+      continue;
+    }
+    if (fileSize > MAX_FILE_SIZE_BYTES) {
+      findings.push(fileTooLargeFinding(relFile, 'содержимое не проверено', fileSize));
+      continue;
+    }
+
+    const content = safeRead(full, fileSize);
+    if (content === UNREADABLE) {
+      findings.push(fileUnreadableFinding(relFile));
+    } else if (content) {
+      findings.push(...scanContent(relFile, content, 'WARN'));
+    }
+  }
+  return findings;
 }
 
 // Builds the standard file_unreadable finding so all four callers in scan()
@@ -838,6 +898,21 @@ function safeRead(filePath, knownSize) {
 function safeReadStaged(projectRoot, relPath) {
   const { execFileSync } = require('child_process');
   const object = `:./${toPosixPath(relPath)}`;
+  const literalPathspec = `:(literal)${toPosixPath(relPath)}`;
+  try {
+    const indexEntry = execFileSync('git', ['ls-files', '--stage', '-z', '--', literalPathspec], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: 1024 * 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    }).toString('utf8');
+    const records = indexEntry.split('\0').filter(Boolean);
+    if (records.length !== 1 || !/^\d{6} /.test(records[0])) return UNREADABLE;
+    if (records[0].slice(0, 6) === '160000') return NON_BLOB;
+  } catch (_) {
+    return UNREADABLE;
+  }
+
   let size;
   try {
     const output = execFileSync('git', ['cat-file', '-s', object], {

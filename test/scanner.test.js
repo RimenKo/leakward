@@ -324,6 +324,39 @@ test('CLAUDE.md with a real secret pattern is still CRITICAL', () => {
   );
 });
 
+test('gitignored local CLAUDE.md scans real secrets as WARN without a filename-only finding', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, '.gitignore', 'CLAUDE.md\n');
+  writeFile(dir, 'CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+
+  const findings = scanIsolated(dir);
+  const secretPatterns = findingsFor(findings, 'CLAUDE.md');
+  assert.strictEqual(secretPatterns.length, 1, 'the real secret in an excluded local document must still be visible');
+  assert.strictEqual(secretPatterns[0].severity, 'WARN', 'a local excluded document is a warning, not a pending leak');
+  assert.strictEqual(
+    findings.filter((f) => f.type === 'ai_secret_file_exists' && f.file === 'CLAUDE.md').length,
+    0,
+    'the filename alone must not create a finding'
+  );
+});
+
+test('content-sensitive filename aliases resolve to one physical file and are not double-scanned', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'CLAUDE.md']);
+  const lowerAlias = path.join(dir, 'claude.md');
+  if (!fs.existsSync(lowerAlias)) fs.symlinkSync('CLAUDE.md', lowerAlias);
+
+  const findings = scanIsolated(dir);
+  const allAliasMatches = findings.filter((f) =>
+    f.type === 'secret_pattern' && (f.file === 'CLAUDE.md' || f.file === 'claude.md')
+  );
+  assert.strictEqual(allAliasMatches.length, 1, 'one physical sensitive document must produce one content match');
+  assert.strictEqual(allAliasMatches[0].severity, 'CRITICAL');
+});
+
 // ── mixed AI folder: part npm-confirmed, part git-only ──────────────────
 // A folder where SOME files are really published by npm and others are only
 // exposed via git tracking must report both counts/channels separately — an
@@ -1175,8 +1208,88 @@ test('CLI: every staged CLAUDE.md variant passes when safe and catches a secret 
       assert.strictEqual(status, 1, `${path.basename(cli)}: staged ${relFile} secret must block despite a working-tree symlink`);
       assert.ok(output.includes('КРИТИЧНО'), `${path.basename(cli)}: ${relFile} content match must be CRITICAL`);
       assert.ok(output.includes(relFile), `${path.basename(cli)}: critical output must name ${relFile}`);
+      assert.match(output, /КРИТИЧНО[^\n]*\(1\):/, `${path.basename(cli)}: ${relFile} must produce exactly one CRITICAL`);
+      assert.strictEqual(
+        (output.match(/Anthropic API key: sk-\*\*\*\[37\]/g) || []).length,
+        1,
+        `${path.basename(cli)}: ${relFile} must report the exact masked Anthropic match once`
+      );
     }
   }
+});
+
+test('CLI: staged POSIX filename containing a backslash is preserved and scanned', () => {
+  if (path.sep === '\\') return;
+
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  const relFile = 'back\\slash.js';
+  writeFile(dir, relFile, `const key = "${FAKE_SECRET}";\n`);
+  git(dir, ['add', relFile]);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'the staged secret in a literal-backslash filename must block');
+  assert.ok(output.includes(relFile), 'the finding must preserve the literal POSIX filename');
+  assert.strictEqual(
+    (output.match(/AWS Access Key ID: AKI\*\*\*\[20\]/g) || []).length,
+    1,
+    'the output must prove that the literal-backslash blob was read and its AWS pattern scanned'
+  );
+  assert.doesNotMatch(output, /Сканер не может подтвердить отсутствие секретов/);
+});
+
+test('CLI: unreadable staged blob fails closed for an ordinary filename', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  const relFile = 'ordinary.js';
+  writeFile(dir, relFile, 'module.exports = 1;\n');
+  git(dir, ['add', relFile]);
+
+  const objectId = execFileSync('git', ['rev-parse', `:./${relFile}`], { cwd: dir, encoding: 'utf8' }).trim();
+  const objectPath = path.join(dir, '.git', 'objects', objectId.slice(0, 2), objectId.slice(2));
+  fs.unlinkSync(objectPath);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || err.stderr || '';
+  }
+  assert.strictEqual(status, 1, 'a staged blob that cannot be read must block the commit');
+  assert.ok(output.includes('ordinary.js'), 'the blocking output must name the unreadable staged file');
+  assert.ok(output.includes('ВЫСОКИЙ РИСК'), 'an unreadable ordinary staged blob must produce a blocking HIGH finding');
+  assert.ok(output.includes('Сканер не может подтвердить отсутствие секретов'));
+  assert.ok(output.includes('найдены блокирующие проблемы'));
+  assert.doesNotMatch(output, /AWS Access Key ID/);
+});
+
+test('CLI: staged gitlink is skipped as a non-blob index entry', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'README.md', '# baseline\n');
+  git(dir, ['add', 'README.md']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+  const commitId = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+  git(dir, ['update-index', '--add', '--cacheinfo', '160000', commitId, 'vendor']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('Всё чисто'), 'a gitlink carries a commit ID, not file content to scan');
+  assert.doesNotMatch(output, /vendor/);
 });
 
 test('CLI: staged non-sensitive binary and oversized files keep their previous non-blocking behavior', () => {

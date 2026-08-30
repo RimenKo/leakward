@@ -128,8 +128,8 @@ if (blocking > 0) {
     console.log(`Добавь в .npmignore:\n`);
     console.log(`  .claude\n  .cursor\n  .env\n  *.local\n`);
   } else {
-    console.log(`${COLORS.yellow}${COLORS.bold}❌ Публикация заблокирована: найдены секреты в публикуемых файлах.${COLORS.reset}`);
-    console.log(`Убери секреты из файлов или перенеси в переменные окружения.\n`);
+    console.log(`${COLORS.yellow}${COLORS.bold}❌ Публикация заблокирована: найдены блокирующие проблемы в публикуемых файлах.${COLORS.reset}`);
+    console.log(`Устрани найденные проблемы: убери подтверждённые секреты или восстанови возможность проверить файлы.\n`);
   }
   process.exit(1);
 } else {
