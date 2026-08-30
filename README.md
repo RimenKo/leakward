@@ -140,19 +140,17 @@ Project: /my-package
 
 🚨 CRITICAL — publish blocked (1):
    CLAUDE.md
-   This file contains API keys and tokens — it will be included in your npm package!
-
-⚠️  HIGH RISK — publish blocked (2):
-   CLAUDE.md
    Anthropic API key: sk-ant-***...agAA
-   CLAUDE.md
-   Crypto mnemonic (BIP39 seed): abandon ability ***...*** 
+
+⚠️  HIGH RISK — publish blocked (1):
+   src/config.js
+   AWS Access Key ID: AKI***[20]
 
 💡 WARNINGS (1):
    .env
    Excluded from publish but contains 2 secrets: AWS Access Key ID, Generic secret in env
 
-❌ Publish blocked: 1 critical + 2 high findings.
+❌ Publish blocked: 1 critical + 1 high findings.
 Add to .npmignore:
   .claude
   .cursor
@@ -256,8 +254,8 @@ chmod +x .git/hooks/pre-commit
 
 | Level | Meaning | Blocks publish? |
 |-------|---------|-----------------|
-| 🚨 CRITICAL | AI secret file will be included in the package | ✅ Yes |
-| ⚠️ HIGH | Known secret pattern found in a publishable file | ✅ Yes |
+| 🚨 CRITICAL | Known secret-bearing AI config is publishable, or a real secret match in a high-risk AI context file (e.g. `CLAUDE.md`) | ✅ Yes |
+| ⚠️ HIGH | Known secret pattern found in any other publishable file | ✅ Yes |
 | 💡 WARN | Risk exists locally (excluded file contains secrets, missing .npmignore) | ❌ No |
 
 ---

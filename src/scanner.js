@@ -24,11 +24,13 @@ function toPosixPath(value) {
 
 // Exact list entries plus any deeper path whose final segment matches a
 // root-level sensitive basename (docs/CLAUDE.md, apps/x/claude.md, …).
+// Basename compare is case-insensitive so Claude.md / CLAUDE.MD stay covered
+// on case-sensitive filesystems without enumerating every spelling.
 function isContentSensitiveFile(relFile) {
   const posix = toPosixPath(relFile);
   if (AI_CONTENT_SENSITIVE_FILES.includes(posix)) return true;
-  const base = posix.includes('/') ? posix.slice(posix.lastIndexOf('/') + 1) : posix;
-  return AI_CONTENT_SENSITIVE_FILES.some((entry) => !entry.includes('/') && entry === base);
+  const base = (posix.includes('/') ? posix.slice(posix.lastIndexOf('/') + 1) : posix).toLowerCase();
+  return AI_CONTENT_SENSITIVE_FILES.some((entry) => !entry.includes('/') && entry.toLowerCase() === base);
 }
 
 /**
@@ -797,8 +799,10 @@ function unscannedBlockingFinding(file, reason) {
 function scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRules) {
   const findings = [];
   const seenFiles = new Set();
-  for (const relFile of AI_CONTENT_SENSITIVE_FILES) {
-    if (!publishFiles.includes(relFile)) continue;
+  const published = new Set(publishFiles.map(toPosixPath));
+
+  for (const relFile of published) {
+    if (!isContentSensitiveFile(relFile)) continue;
     const full = resolveWithinRoot(projectRoot, relFile);
     if (!full) continue;
     try {
@@ -807,8 +811,16 @@ function scanExcludedContentSensitiveFiles(projectRoot, publishFiles, ignoreRule
     } catch (_) {}
   }
 
-  for (const relFile of AI_CONTENT_SENSITIVE_FILES) {
-    if (publishFiles.includes(relFile)) continue;
+  // Exact list plus nested basename matches discovered on disk (e.g. a
+  // gitignored docs/CLAUDE.md that never entered publishFiles).
+  const candidates = new Set(AI_CONTENT_SENSITIVE_FILES.map(toPosixPath));
+  for (const relFile of walkAllFiles(projectRoot) || []) {
+    const posix = toPosixPath(relFile);
+    if (isContentSensitiveFile(posix)) candidates.add(posix);
+  }
+
+  for (const relFile of candidates) {
+    if (published.has(relFile)) continue;
     if (ignoreRules.length && isPathIgnored(relFile, ignoreRules)) continue;
 
     const full = resolveWithinRoot(projectRoot, relFile);
