@@ -324,6 +324,22 @@ test('CLAUDE.md with a real secret pattern is still CRITICAL', () => {
   );
 });
 
+test('nested docs/CLAUDE.md with a secret is CRITICAL by basename, not only at repo root', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'docs/CLAUDE.md', `API key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'docs/CLAUDE.md']);
+
+  const findings = scanIsolatedWith(dir, { files: ['docs/CLAUDE.md'] });
+  const secretPatterns = findingsFor(findings, 'docs/CLAUDE.md');
+  assert.strictEqual(secretPatterns.length, 1, 'nested CLAUDE.md content must still be scanned');
+  assert.strictEqual(
+    secretPatterns[0].severity,
+    'CRITICAL',
+    'basename-matched CLAUDE.md keeps the content-sensitive severity'
+  );
+});
+
 test('gitignored local CLAUDE.md scans real secrets as WARN without a filename-only finding', () => {
   const dir = makeTempProject();
   initGitRepo(dir);

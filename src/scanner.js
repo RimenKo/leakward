@@ -22,6 +22,15 @@ function toPosixPath(value) {
   return path.sep === '\\' ? text.split('\\').join('/') : text;
 }
 
+// Exact list entries plus any deeper path whose final segment matches a
+// root-level sensitive basename (docs/CLAUDE.md, apps/x/claude.md, …).
+function isContentSensitiveFile(relFile) {
+  const posix = toPosixPath(relFile);
+  if (AI_CONTENT_SENSITIVE_FILES.includes(posix)) return true;
+  const base = posix.includes('/') ? posix.slice(posix.lastIndexOf('/') + 1) : posix;
+  return AI_CONTENT_SENSITIVE_FILES.some((entry) => !entry.includes('/') && entry === base);
+}
+
 /**
  * Returns list of files that will be included in npm publish.
  * Union of two real sources of truth: `git ls-files` (what git tracks / would
@@ -507,7 +516,7 @@ function scan(projectRoot, options) {
   for (const aiFolder of AI_FOLDERS) {
     const inPublish = publishFiles.filter((f) => {
       const inFolder = f.startsWith(aiFolder + '/') || f === aiFolder;
-      return inFolder && !AI_CONTENT_SENSITIVE_FILES.includes(f);
+      return inFolder && !isContentSensitiveFile(f);
     });
     if (inPublish.length > 0) {
       // npm pack succeeded but confirms only SOME (or none) of these paths →
@@ -619,7 +628,7 @@ function scan(projectRoot, options) {
   for (const relFile of publishFiles) {
     if (AI_SECRET_FILES.includes(relFile)) continue;
 
-    const contentSensitive = AI_CONTENT_SENSITIVE_FILES.includes(relFile);
+    const contentSensitive = isContentSensitiveFile(relFile);
     let content;
     let fileSize;
     if (options.staged) {

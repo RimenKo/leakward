@@ -76,6 +76,7 @@ const AI_CONTENT_SENSITIVE_FILES = [
   // 63+ in CLAUDE.md variants alone — devs paste secrets into context files
   'CLAUDE.md',
   'claude.md',
+  'CLAUDE.MD',
   '.claude/CLAUDE.md',
 ];
 

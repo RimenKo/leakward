@@ -65,7 +65,7 @@ These folders are **not excluded by default** from `npm publish` or `git push`. 
 `.claude/`, `.cursor/`, `.windsurf/`, and 9 more — if any are included in your npm tarball or git commit, publish is blocked.
 
 ### Known AI context files with secrets
-`CLAUDE.md`, `mcp.json`, `settings.local.json` — scanned and blocked if published. Even when excluded from publish, `leakward` shows you **which specific secrets** are inside, so you know the blast radius if your ignore config ever breaks.
+`CLAUDE.md` is scanned for secret patterns and blocked only when a real match is found (the filename alone is not enough). Known secret-bearing config files (`mcp.json`, `settings.local.json`) are still blocked if published. Even when excluded from publish, `leakward` shows you **which specific secrets** are inside, so you know the blast radius if your ignore config ever breaks.
 
 ### Secrets in published files — 55+ patterns
 
