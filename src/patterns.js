@@ -135,10 +135,10 @@ function isPlausibleSecretValue(rawValue) {
   // unquoted mixed-case secret with no digit, which an existing test
   // deliberately requires this function to keep flagging. On a real
   // multi-project corpus this is dominated by two carriers, not the
-  // `Optional`/`getEnvOrDefault` examples first used to describe it: plain
-  // camelCase JS property reads (`token: someToken`, `secret =
-  // currentSession.secret`) and typed annotations (`token: Optional`,
-  // `secret: StrictStr`) — together roughly a quarter of what this pattern
+  // `Optional`/`getEnvOrDefault` examples first used to describe it: a
+  // camelCase JS property read assigned from another camelCase object
+  // property, and a typed Python/pydantic-style annotation (bare type name
+  // as the "value") — together roughly a quarter of what this pattern
   // still flags on such a corpus. Rejecting bare identifiers regardless of
   // case (tried and reverted the same day) closed the code-identifier case
   // but broke that real-secret case, and no regex-only signal (length,
