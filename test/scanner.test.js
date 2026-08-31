@@ -1406,6 +1406,123 @@ test('CLI: nested project root scans relative staged paths and ignores staged fi
   assert.ok(output.includes('КРИТИЧНО'), 'nested project CLAUDE.md keeps the sensitive-path severity');
 });
 
+// ── --staged scans added lines only (not the full blob vs HEAD) ──────────
+// Regression for leakward-guard.sh blocking commits because an old secret
+// already in HEAD was still present in the staged blob of an unrelated edit.
+test('CLI: --staged does not block on a secret already in HEAD when the staged diff only adds a safe line', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'config.js', `const legacy = "${FAKE_SECRET}";\nmodule.exports = {};\n`);
+  git(dir, ['add', 'config.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline with legacy secret']);
+
+  writeFile(dir, 'config.js', `const legacy = "${FAKE_SECRET}";\nmodule.exports = { ok: true };\n`);
+  git(dir, ['add', 'config.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('Всё чисто'), 'a secret already in HEAD and absent from added staged lines must not block');
+  assert.doesNotMatch(output, /AWS Access Key ID/);
+});
+
+test('CLI: --staged still blocks when the staged diff newly adds a secret line', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'config.js', 'module.exports = {};\n');
+  git(dir, ['add', 'config.js']);
+  git(dir, ['commit', '--quiet', '-m', 'clean baseline']);
+
+  writeFile(dir, 'config.js', `module.exports = { key: "${FAKE_SECRET}" };\n`);
+  git(dir, ['add', 'config.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'a newly added secret line in the staged diff must block');
+  assert.ok(output.includes('config.js'), 'blocking output must name the file with the new secret');
+  assert.ok(output.includes('AWS Access Key ID'), 'blocking output must report the newly added secret pattern');
+});
+
+test('CLI: --staged does not block on a CLAUDE.md secret already in HEAD when only a safe line is added', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'CLAUDE.md', `# Rules\nAPI key: ${FAKE_ANTHROPIC_SECRET}\n`);
+  git(dir, ['add', 'CLAUDE.md']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline docs with legacy secret']);
+
+  writeFile(dir, 'CLAUDE.md', `# Rules\nAPI key: ${FAKE_ANTHROPIC_SECRET}\nUse canonical paths.\n`);
+  git(dir, ['add', 'CLAUDE.md']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('Всё чисто'), 'legacy CLAUDE.md secret already in HEAD must not block a safe staged edit');
+  assert.doesNotMatch(output, /Anthropic API key/);
+});
+
+test('CLI: --staged pure rename of a file that already has a secret in HEAD does not block', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'old-name.js', `const legacy = "${FAKE_SECRET}";\n`);
+  git(dir, ['add', 'old-name.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline with legacy secret']);
+  git(dir, ['mv', 'old-name.js', 'new-name.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('Всё чисто'), 'a pure rename must not re-scan legacy secret lines as newly added');
+  assert.doesNotMatch(output, /AWS Access Key ID/);
+});
+
+test('CLI: --staged rename into an AI_SECRET_FILES path still blocks as a newly published secret file', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'plain.json', '{"ok":true}\n');
+  git(dir, ['add', 'plain.json']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
+  git(dir, ['mv', 'plain.json', '.claude/settings.local.json']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'moving a file onto an AI secret path must still block');
+  assert.ok(output.includes('.claude/settings.local.json'), 'blocking output must name the AI secret path');
+  assert.ok(output.includes('КРИТИЧНО'), 'new AI secret path must be CRITICAL');
+});
+
+test('CLI: --staged nested project root keeps rename pairing with --relative paths', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'project/old.js', `const legacy = "${FAKE_SECRET}";\n`);
+  git(dir, ['add', 'project/old.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline nested']);
+  git(dir, ['mv', 'project/old.js', 'project/new.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  const projectRoot = path.join(dir, 'project');
+  const output = execFileSync(process.execPath, [cli, projectRoot, '--staged'], { encoding: 'utf8', env });
+  assert.ok(output.includes('Всё чисто'), 'nested-root pure rename must not re-flag a legacy secret');
+  assert.doesNotMatch(output, /AWS Access Key ID/);
+});
+
 // ── aiguard:allow + .aiguardignore (false-positive suppression) ──
 test('scan(): line with aiguard:allow is not reported; same pattern in another file without the marker still is', () => {
   const dir = makeTempProject();

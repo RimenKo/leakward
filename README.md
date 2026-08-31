@@ -113,7 +113,7 @@ leakward --history
 leakward /path/to/project --history
 ```
 
-`--staged` scans the git index only. Local gitignored `CLAUDE.md` files are not part of that pending commit, so their excluded-content WARN path does not run in `--staged` mode.
+`--staged` scans only lines **added** by the staged diff (against HEAD). A secret already present in HEAD does not block the commit unless the staged change re-introduces or newly adds it. Local gitignored `CLAUDE.md` files are not part of that pending commit, so their excluded-content WARN path does not run in `--staged` mode.
 
 **Exit codes:**
 - `0` — clean or warnings only
@@ -223,14 +223,22 @@ if ! echo "$CMD" | grep -qE '^\s*(git\s+(push|commit|tag)\b|npm\s+publish\b)'; t
     exit 0
 fi
 
+# git commit → --staged (only newly added lines). Full-tree scan on commit
+# re-blocked on secrets already in HEAD — the bug this flag exists to prevent.
+# git push / npm publish → full project scan.
+ARGS=("$(pwd)")
+if echo "$CMD" | grep -qE '^\s*git\s+commit\b'; then
+    ARGS+=("--staged")
+fi
+
 if command -v leakward &>/dev/null; then
-    leakward "$(pwd)" 2>&1
+    leakward "${ARGS[@]}" 2>&1
     exit $?
 elif command -v aiguard &>/dev/null; then
-    aiguard "$(pwd)" 2>&1
+    aiguard "${ARGS[@]}" 2>&1
     exit $?
 else
-    npx --yes @rimenko-dev/leakward "$(pwd)" 2>&1
+    npx --yes @rimenko-dev/leakward "${ARGS[@]}" 2>&1
     exit $?
 fi
 ```
@@ -240,18 +248,15 @@ fi
 ## Use as a pre-commit hook (git)
 
 ```bash
-# In your project root:
-echo '#!/bin/sh\nleakward .' > .git/hooks/pre-commit
+# In your project root — --staged scans only lines added by this commit:
+echo '#!/bin/sh\nleakward --staged .' > .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
-> **Note:** leakward shells out to `npm pack --dry-run` internally to get npm's
-> exact publish list (secrets in `dist/` or in `README.md`/`package.json`
-> otherwise slip through), which adds roughly 0.3–1.5s per run. That's on
-> every commit if you use it as a pre-commit hook. If that's noticeable on a
-> large repo with frequent commits, a `pre-push` hook (same one-liner, just
-> in `.git/hooks/pre-push`) still catches everything before a secret leaves
-> your machine, at a fraction of the invocation count.
+> **Note:** A full (non-`--staged`) scan shells out to `npm pack --dry-run` to
+> get npm's exact publish list, which adds roughly 0.3–1.5s per run. Prefer
+> `leakward --staged` in pre-commit (fast, added-lines only). Use a full scan
+> in `pre-push` / before `npm publish` if you want the complete publish-set check.
 
 ---
 

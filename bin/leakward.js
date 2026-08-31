@@ -12,7 +12,7 @@ if (flags.includes('--help') || flags.includes('-h')) {
 
 Usage:
   leakward [path]              Scan a project (default: current directory)
-  leakward [path] --staged     Scan only files staged for commit (git diff --cached)
+  leakward [path] --staged     Scan only lines added by the staged diff (git diff --cached)
   leakward [path] --npm-only   Scan only what \`npm pack\` would publish (used by prepublishOnly)
   leakward [path] --history    Also scan the full git history for leaked secrets
   leakward --help              Show this help

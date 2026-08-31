@@ -553,9 +553,53 @@ function scan(projectRoot, options) {
     }
   }
 
+  // Rename destinations → HEAD source path. Built once for --staged so git
+  // diff keeps rename pairs (a lone new-path pathspec looks like a new file).
+  const stagedRenameSources = options.staged ? getStagedRenameSourceMap(projectRoot) : null;
+
   // 2. Check known AI secret files
   for (const secretFile of AI_SECRET_FILES) {
     if (ignoreRules.length && isPathIgnored(secretFile, ignoreRules)) continue;
+    const inPublish = publishFiles.includes(secretFile);
+
+    // --staged: only newly added lines of a staged AI-secret file matter.
+    // Do not block on secrets already in HEAD, and skip unstaged local copies.
+    if (options.staged) {
+      if (!inPublish) continue;
+      const content = safeReadStagedAddedContent(projectRoot, secretFile, stagedRenameSources);
+      if (content === TOO_LARGE) {
+        findings.push(fileTooLargeFinding(secretFile, 'пропущен без сканирования'));
+        findings.push(unscannedBlockingFinding(secretFile, 'содержимое AI-secret файла превышает лимит сканера'));
+        continue;
+      }
+      if (content === UNREADABLE) {
+        findings.push(fileUnreadableFinding(secretFile));
+        findings.push(unscannedBlockingFinding(secretFile, 'не удалось проверить содержимое из git index'));
+        continue;
+      }
+      if (content === NON_BLOB) continue;
+      // Presence CRITICAL keys off this path in HEAD (not the rename source):
+      // `git mv foo .claude/settings.local.json` must still flag the new
+      // AI-secret path even though foo's HEAD blob is non-empty. Run this
+      // before the binary (null) skip so a new binary AI-secret path still blocks.
+      const headAtPath = safeReadHeadText(projectRoot, secretFile);
+      if (headAtPath === UNREADABLE) {
+        findings.push(unscannedBlockingFinding(secretFile, 'не удалось сравнить AI-secret файл с HEAD'));
+      } else if (headAtPath === '') {
+        findings.push({
+          severity: 'CRITICAL',
+          type: 'ai_secret_file_published',
+          file: secretFile,
+          detail: `Этот файл содержит API-ключи и токены — он уйдёт в ${context}!`,
+        });
+      }
+      if (content === null) continue;
+      if (content) {
+        findings.push(...scanContent(secretFile, content, 'CRITICAL'));
+      }
+      continue;
+    }
+
     const full = path.join(projectRoot, secretFile);
     if (!fs.existsSync(full)) continue;
 
@@ -573,7 +617,6 @@ function scan(projectRoot, options) {
       });
     }
 
-    const inPublish = publishFiles.includes(secretFile);
     if (inPublish) {
       // Same reasoning as section 1 above: only relabel the channel when npm
       // pack ran successfully and positively excluded this exact file — and
@@ -633,7 +676,10 @@ function scan(projectRoot, options) {
     let content;
     let fileSize;
     if (options.staged) {
-      content = safeReadStaged(projectRoot, relFile);
+      // Pre-commit must block only secrets newly introduced by this commit.
+      // Scanning the full staged blob re-flagged secrets already in HEAD and
+      // made leakward-guard.sh reject unrelated edits to old files.
+      content = safeReadStagedAddedContent(projectRoot, relFile, stagedRenameSources);
     } else {
       const full = resolveWithinRoot(projectRoot, relFile);
       if (!full) continue; // defense in depth — publishFiles should already be root-safe
@@ -958,6 +1004,227 @@ function safeRead(filePath, knownSize) {
     // signal — previously only EACCES/EPERM were caught this way and every
     // other code (EMFILE/EIO included) fell through to a silent `null`.
     if (err.code === 'ENOENT' && !fs.existsSync(filePath)) return null;
+    return UNREADABLE;
+  }
+}
+
+// Returns only lines newly introduced by the staged change (relative to HEAD,
+// or relative to an empty tree when the path is new / there is no HEAD yet).
+// Used by --staged so a secret already present in HEAD does not block a
+// commit that does not re-add it. Classification errors (unreadable, too
+// large, gitlink, binary) reuse the same symbols as safeReadStaged().
+//
+// Primary source is `git diff --cached -U0`: that correctly yields no added
+// lines for a pure rename (R) and never needs to load an oversized HEAD blob.
+// Multiset fallback covers the rare case where git reports a binary diff but
+// our own decoder still produced text (UTF-16 with BOM).
+function safeReadStagedAddedContent(projectRoot, relPath, renameSources) {
+  const staged = safeReadStaged(projectRoot, relPath);
+  if (typeof staged !== 'string') return staged;
+
+  const fromDiff = readStagedDiffAddedLines(projectRoot, relPath, renameSources);
+  if (fromDiff === UNREADABLE) return UNREADABLE;
+  if (typeof fromDiff === 'string') return fromDiff;
+
+  // BINARY_DIFF: git could not produce a text patch; subtract HEAD ourselves.
+  // For renames, subtract the old path's HEAD blob, not the (missing) new path.
+  const posix = toPosixPath(relPath);
+  const headPath = (renameSources && renameSources.get(posix)) || posix;
+  const head = safeReadHeadText(projectRoot, headPath);
+  if (head === UNREADABLE) return UNREADABLE;
+  // Oversized HEAD: refuse full-blob fallback (would re-flag legacy secrets).
+  if (head === TOO_LARGE) return TOO_LARGE;
+  // Binary/gitlink at HEAD with a text staged blob is a type change — every
+  // staged text line is newly introduced content, so scanning it is correct.
+  if (head === null || head === NON_BLOB) return staged;
+  return addedLinesByMultiset(head, staged);
+}
+
+const BINARY_DIFF = Symbol('binary_staged_diff');
+
+// newPath -> oldPath for staged renames (similarity R*). Built once per scan.
+function getStagedRenameSourceMap(projectRoot) {
+  const { execFileSync } = require('child_process');
+  const map = new Map();
+  let output;
+  try {
+    output = execFileSync(
+      // -M: force rename detection even when the user's diff.renames=false.
+      // --relative: paths match getStagedFiles / projectRoot-relative scan paths
+      // (nested project roots would otherwise disagree with +++ paths below).
+      'git', ['diff', '--cached', '--name-status', '-z', '--diff-filter=R', '-M', '--relative', '--', '.'],
+      {
+        cwd: projectRoot,
+        stdio: 'pipe',
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
+      }
+    ).toString('utf8');
+  } catch (_) {
+    return map;
+  }
+  // Records: R100\0old\0new\0R095\0old2\0new2\0...
+  const parts = output.split('\0').filter(Boolean);
+  for (let i = 0; i < parts.length; ) {
+    const status = parts[i];
+    if (!/^R\d*$/.test(status) || i + 2 >= parts.length) {
+      i += 1;
+      continue;
+    }
+    map.set(toPosixPath(parts[i + 2]), toPosixPath(parts[i + 1]));
+    i += 3;
+  }
+  return map;
+}
+
+// Added lines from `git diff --cached -U0` for one path. Empty string means
+// the staged change introduces no new line text (pure rename, mode-only,
+// deletions-only). BINARY_DIFF means git refused a text patch.
+//
+// When `relPath` is a rename destination, the old path must be included in
+// the pathspec — otherwise git breaks the rename pair and reports the new
+// path as a brand-new file (every line added).
+function readStagedDiffAddedLines(projectRoot, relPath, renameSources) {
+  const { execFileSync } = require('child_process');
+  const posix = toPosixPath(relPath);
+  const pathspecs = [`:(literal)${posix}`];
+  const renameFrom = renameSources && renameSources.get(posix);
+  if (renameFrom) pathspecs.unshift(`:(literal)${renameFrom}`);
+
+  let diffOutput;
+  try {
+    diffOutput = execFileSync(
+      // --relative must match getStagedRenameSourceMap / getStagedFiles so
+      // parseDiffNewPath(+++ …) compares equal to projectRoot-relative posix.
+      'git', ['diff', '--cached', '--no-color', '-U0', '-M', '--relative', '--', ...pathspecs],
+      {
+        cwd: projectRoot,
+        stdio: 'pipe',
+        maxBuffer: MAX_FILE_SIZE_BYTES + 1024,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
+      }
+    ).toString('utf8');
+  } catch (err) {
+    if (err.code === 'ETIMEDOUT' || err.code === 'ENOENT' || err.code === 'EACCES') {
+      return UNREADABLE;
+    }
+    // Some git builds still exit 1 when the cached diff is non-empty.
+    if ((err.status === 1 || err.status === 0) && err.stdout != null) {
+      diffOutput = err.stdout.toString('utf8');
+    } else {
+      return UNREADABLE;
+    }
+  }
+
+  if (/^Binary files /m.test(diffOutput) || /^GIT binary patch/m.test(diffOutput)) {
+    return BINARY_DIFF;
+  }
+
+  // Pure rename diffs have no '+' hunks → empty string. Rename+edit / ordinary
+  // edits set +++ to the new path; when the old path is also in the pathspec,
+  // ignore any additions that somehow attribute to a different +++ target.
+  const added = [];
+  let currentFile = '';
+  for (const line of diffOutput.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      currentFile = '';
+    } else if (line.startsWith('+++ ')) {
+      currentFile = parseDiffNewPath(line);
+    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+      if (renameFrom && currentFile && currentFile !== posix) continue;
+      added.push(line.slice(1));
+    }
+  }
+  return added.join('\n');
+}
+
+// Lines present in `stagedText` whose multiset count exceeds that of
+// `headText`. Position-agnostic on purpose: an unchanged secret line already
+// in HEAD is excluded even if surrounding edits shift its line number; a
+// brand-new secret line is included. Same-line allow markers still work
+// because the full new line text (including the marker) is what gets scanned.
+function addedLinesByMultiset(headText, stagedText) {
+  const headCounts = new Map();
+  for (const line of String(headText).split('\n')) {
+    headCounts.set(line, (headCounts.get(line) || 0) + 1);
+  }
+  const added = [];
+  for (const line of String(stagedText).split('\n')) {
+    const n = headCounts.get(line) || 0;
+    if (n > 0) {
+      headCounts.set(line, n - 1);
+    } else {
+      added.push(line);
+    }
+  }
+  return added.join('\n');
+}
+
+// Decoded text of the HEAD blob for relPath, or '' when the path is absent /
+// there is no HEAD yet (first commit). Uses the same :(literal) pathspec as
+// safeReadStaged so unusual names cannot silently look like "new files".
+function safeReadHeadText(projectRoot, relPath) {
+  const { execFileSync } = require('child_process');
+  const posix = toPosixPath(relPath);
+  const literalPathspec = `:(literal)${posix}`;
+
+  let records;
+  try {
+    const indexLike = execFileSync('git', ['ls-tree', '-z', 'HEAD', '--', literalPathspec], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: 1024 * 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    }).toString('utf8');
+    records = indexLike.split('\0').filter(Boolean);
+  } catch (err) {
+    if (err.code === 'ETIMEDOUT' || err.code === 'ENOENT' || err.code === 'EACCES') {
+      return UNREADABLE;
+    }
+    const stderr = (err.stderr || '').toString();
+    // Unborn HEAD / not a git revision — treat as empty tree, not unreadable.
+    if (/unknown revision|bad revision|ambiguous argument|needed a single revision|not a valid object name/i.test(stderr)) {
+      return '';
+    }
+    return UNREADABLE;
+  }
+
+  if (records.length === 0) return '';
+  if (records.length !== 1) return UNREADABLE;
+
+  // ls-tree -z: "<mode> SP <type> SP <object> TAB <file>" then NUL.
+  const rec = records[0];
+  const metaMatch = /^(\d{6}) (blob|commit|tree) ([0-9a-f]+)\t/.exec(rec);
+  if (!metaMatch) return UNREADABLE;
+  if (metaMatch[1] === '160000' || metaMatch[2] !== 'blob') return NON_BLOB;
+  const oid = metaMatch[3];
+
+  let size;
+  try {
+    const output = execFileSync('git', ['cat-file', '-s', oid], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: 1024 * 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    }).toString('utf8').trim();
+    size = Number(output);
+  } catch (_) {
+    return UNREADABLE;
+  }
+  if (!Number.isSafeInteger(size) || size < 0) return UNREADABLE;
+  if (size > MAX_FILE_SIZE_BYTES) return TOO_LARGE;
+
+  try {
+    const buf = execFileSync('git', ['cat-file', 'blob', oid], {
+      cwd: projectRoot,
+      stdio: 'pipe',
+      maxBuffer: MAX_FILE_SIZE_BYTES + 1024,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    const bom = detectUtf16Bom(buf);
+    if (!bom && isBinaryBuffer(buf)) return null;
+    return decodeText(buf, bom);
+  } catch (_) {
     return UNREADABLE;
   }
 }
