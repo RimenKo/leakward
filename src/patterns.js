@@ -80,6 +80,81 @@ const AI_CONTENT_SENSITIVE_FILES = [
   '.claude/CLAUDE.md',
 ];
 
+// Shared by 'Generic secret in env' and 'Generic secret key (*_KEY)' below
+// (see SECRET_PATTERNS) — kept in one place so the two rules cannot drift
+// out of sync the way they already did once (the *_KEY rule shipped for a
+// long time with no validate() at all while this one had it).
+//
+// Round 1 (2026-08-31): added this function at all — the *_KEY rule
+// previously had none, so it flagged every assignment unconditionally,
+// including plain `X_KEY = os.environ.get(...)` reads (258 false positives
+// in one real project). Round 2 (same day, independent reviewer): dropping
+// the original "digit or mixed case" requirement to let uppercase-only
+// base32/TOTP secrets through reopened the exact disease this function was
+// meant to cure — 460 confirmed false positives on a real multi-project
+// corpus (`password = password`, `token = access_token`, `secret =
+// client_secret`, ...), because a bare lowercase code identifier has
+// neither a digit nor mixed case either. The digit-or-mixed-case fallback
+// is back; base32 gets its own dedicated, narrow carve-out instead of a
+// blanket relaxation.
+//
+// A quoted value is always accepted — a human-typed spaced passphrase in
+// quotes is still a plausible real secret. `[\s\S]` instead of `.` so a
+// real secret that happens to be wrapped across two lines is not silently
+// dropped (`.` excludes newlines by default in JS regex; found live —
+// multi-line quoted values were failing this check as "not a string").
+function isPlausibleSecretValue(rawValue) {
+  if (/^["'][\s\S]*["']$/.test(rawValue)) return true;
+  if (/^-?\d+(?:\.\d+)?$/.test(rawValue)) return false;
+  // Strip a trailing TypeScript non-null/optional-chaining tail (`!`/`?`)
+  // before the shape checks below — `process.env.API_KEY!` is still a
+  // dotted chain; the bare `!` shouldn't be enough to dodge that check
+  // (found live: it broke the chain regex's `$` anchor and let the whole
+  // value fall through to the digit-or-mixed-case fallback instead).
+  const value = rawValue.replace(/[!?]+$/, '').replace(/\?\./g, '.');
+  // A dotted identifier chain with no digit anywhere (`process.env.API_KEY`,
+  // `settings.STRIPE_API_KEY`, `Path.home`) reads as code, not a secret.
+  // Digit-excluded so a real password/token that happens to contain a
+  // literal dot (`Passw0rd.Secure`, `v2.abc123def456`) or a JWT (always has
+  // a digit somewhere in its base64 segments) is never mistaken for one.
+  // No length cap here — one was tried and dropped: it was never exercised
+  // by any real secret in testing (the JWT fixture is protected by the
+  // digit check alone) and it let through anything 40+ chars regardless of
+  // shape, including plain dotted code references.
+  if (!/\d/.test(value) && /^[A-Za-z_$][A-Za-z_$]*(?:\.[A-Za-z_$][A-Za-z_$]*)+$/.test(value)) return false;
+  // Base32/TOTP secrets (2FA seeds) are a solid run of the base32 alphabet
+  // (A-Z, 2-7) with no separators — real ones carry neither a digit outside
+  // 2-7 nor mixed case, so they need their own carve-out rather than
+  // leaning on the digit-or-mixed-case signal below. Deliberately loose:
+  // this also accepts any 16+ char all-uppercase run that merely happens to
+  // avoid 0/1/8/9 (not just genuine base32) — a narrow, accepted trade-off,
+  // not a bug (0 live false positives from this in either test corpus).
+  if (/^[A-Z2-7]{16,}=*$/.test(value)) return true;
+  // KNOWN LIMITATION, not fixed here: a bare (no-dot) MIXED-CASE identifier
+  // with no digit is indistinguishable by shape alone from a genuine
+  // unquoted mixed-case secret with no digit, which an existing test
+  // deliberately requires this function to keep flagging. On a real
+  // multi-project corpus this is dominated by two carriers, not the
+  // `Optional`/`getEnvOrDefault` examples first used to describe it: plain
+  // camelCase JS property reads (`token: someToken`, `secret =
+  // currentSession.secret`) and typed annotations (`token: Optional`,
+  // `secret: StrictStr`) — together roughly a quarter of what this pattern
+  // still flags on such a corpus. Rejecting bare identifiers regardless of
+  // case (tried and reverted the same day) closed the code-identifier case
+  // but broke that real-secret case, and no regex-only signal (length,
+  // word-shape, entropy) reliably separates the two without a dictionary.
+  // Left as-is; a lowercase-only bare identifier (settings, configuration,
+  // a snake_case name) is still rejected for free by the digit-or-mixed-case
+  // fallback below, since "all one case" already fails that check on its
+  // own — confirmed against 20 realistic snake_case/lowercase variable
+  // names holding password/secret/token values, all correctly rejected.
+  // Everything else: the original digit-or-mixed-case signal — virtually
+  // every real credential format (hex, base64, JWT, vendor API keys) has
+  // one; a plain lowercase word or lowercase.dotted_identifier_chain reads
+  // as code/English, not a secret.
+  return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
+}
+
 // Regex patterns for secrets — ordered by category
 const SECRET_PATTERNS = [
   // ── AI providers ──────────────────────────────────────────────
@@ -229,25 +304,27 @@ const SECRET_PATTERNS = [
     // without this exclusion the match swallows past the syntax and still
     // clears the {8,} floor (found live: a Python kwarg and a SQL upsert
     // column both matched as "secrets" before this fix).
-    regex: /(?:PASSWORD|SECRET|TOKEN)\s*[=:]\s*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,})/gi,
-    // Quoted values keep the old behavior unchanged (a human-typed spaced
-    // passphrase in quotes is still a plausible real secret). Unquoted
-    // values additionally need a digit or mixed case — virtually every real
-    // credential format (hex, base64, JWT, vendor API keys) has one; a
-    // plain lowercase.dotted_identifier_chain (SQL "col = excluded.other",
-    // a python kwarg name) reads as code/English words, not a secret — and
-    // a plain decimal number (a numeric-cost kwarg whose name happens to
-    // end in one of the three trigger words, matched because there's no
-    // word-boundary before PASSWORD/SECRET/TOKEN so it also fires on
-    // identifiers merely ending in one of them) is rejected outright, since
-    // no real secret is ever written as a bare float. Only an all-lowercase,
-    // no-digit passphrase slips past this — an accepted trade-off for the
-    // generic catch-all; dedicated provider patterns above are untouched.
+    //
+    // Two trailing lookaheads, both required — a single `(?!\()` is not
+    // enough on its own: when the greedy {8,} run stops right before a real
+    // `(` (a function call, e.g. `getEnvOrDefault(`), the engine backtracks
+    // to a one-char-shorter match, and that shorter match's next character
+    // is just an ordinary identifier character, not `(` — so a lone
+    // `(?!\()` would pass on the backtracked, truncated match and the call
+    // would still be flagged (confirmed live with an independent reviewer).
+    // `(?![^\s"'(),;{}\[\]<>])` forces the match to be the FULL maximal run
+    // of allowed characters — a backtracked, artificially-shortened match
+    // always fails it, because the character right after it is, by
+    // construction, still an allowed character. Only the true maximal run
+    // (which stops exactly at the real boundary) can satisfy both
+    // lookaheads together, so backtracking has no shorter match left to
+    // fall back to and the whole alternative correctly fails.
+    regex: /(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
     validate: (match) => {
-      const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)\s*[=:]\s*/i, '');
-      if (/^["'].*["']$/.test(value)) return true;
-      if (/^-?\d+(?:\.\d+)?$/.test(value)) return false;
-      return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
+      try {
+        const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*/i, '');
+        return isPlausibleSecretValue(value);
+      } catch (_) { return true; }
     },
   },
   {
@@ -272,7 +349,22 @@ const SECRET_PATTERNS = [
     // alphanumeric run with no underscore (measured: unbounded took ~6.9s
     // on 80KB of hex-like text; {0,63} takes ~13ms on the same input while
     // still matching every real key name, none of which are 60+ chars long).
-    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?\s*[=:]\s*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"']{8,})/g,
+    // Unquoted branch excludes ()[]{}<>,; plus the same two-lookahead
+    // maximal-munch guard as the rule above, for the same reason — without
+    // it, a key name assigned by reading the identically named process
+    // environment variable (a one-line lookup call, common in Python/Node
+    // config loaders) matched the lookup call itself as the leaked value
+    // (confirmed live: 258 false positives in one real project, all
+    // environment-variable reads, zero real secrets among them).
+    // validate() uses the shared isPlausibleSecretValue() (this rule
+    // previously had no validate() at all).
+    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
+    validate: (match) => {
+      try {
+        const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?[ \t]*[=:][ \t]*/, '');
+        return isPlausibleSecretValue(value);
+      } catch (_) { return true; }
+    },
   },
 
   // ── Base64-obfuscated secrets ──────────────────────────────────
@@ -292,4 +384,4 @@ const SECRET_PATTERNS = [
   },
 ];
 
-module.exports = { AI_FOLDERS, AI_SECRET_FILES, AI_CONTENT_SENSITIVE_FILES, SECRET_PATTERNS };
+module.exports = { AI_FOLDERS, AI_SECRET_FILES, AI_CONTENT_SENSITIVE_FILES, SECRET_PATTERNS, isPlausibleSecretValue };

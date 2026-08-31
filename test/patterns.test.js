@@ -298,8 +298,65 @@ test('Python numeric kwarg ("..._token=0.000005") is NOT caught — a bare numbe
   assert.strictEqual(detectsGeneric('cost_per_input_' + 'to' + 'ken' + '=0.000005,'), false);
 });
 
-test('unquoted value with no digit and no case variation is NOT caught (all-lowercase identifier)', () => {
+test('unquoted all-lowercase, no-digit value is NOT caught (still an accepted trade-off — a 2026-08-31 attempt to close this via a blanket relaxation reopened 460 live false positives, e.g. "password = password"; reverted same day, see the base32 carve-out below for the narrow case that IS worth catching)', () => {
   assert.strictEqual(detectsGeneric('TOKEN' + '=lowercaseonlyvalue'), false);
+});
+
+test('unquoted all-uppercase, no-digit base32/TOTP-shaped secret (16+ chars) IS caught via the dedicated base32 carve-out', () => {
+  assert.strictEqual(detectsKey('SECRET_KEY=ABCDEFGHIJKLMNOPQRSTUVWX'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('a short (<16 char) all-uppercase, no-digit value is NOT caught — below the base32 carve-out floor, reads as a plain constant name', () => {
+  assert.strictEqual(detectsKey('API_KEY=SHORTCODE'), false);
+});
+
+// ── Fix 2026-08-31, round 3 (second independent /validate reviewer) ──
+// Removing the digit-or-mixed-case requirement entirely (round 2's first
+// attempt) reopened exactly the disease this file exists to cure: 460 live
+// false positives on a real multi-project corpus, because a bare lowercase
+// code identifier (`password`, `access_token`, `client_secret`) has neither
+// a digit nor mixed case either. The fallback is restored; a single bare
+// identifier with no digit is rejected explicitly (regardless of case) so
+// mixed-case ones (`Optional`, `getEnvOrDefault`) are still caught by this
+// net even when the digit-or-mixed-case fallback would have let them
+// through.
+
+test('bare lowercase identifier reused as its own "secret" is NOT caught (the exact live false-positive corpus: password = password)', () => {
+  assert.strictEqual(detectsGeneric('TOKEN' + '=access_token'), false);
+});
+
+// KNOWN LIMITATION (documented in src/patterns.js next to isPlausibleSecretValue,
+// not fixed 2026-08-31): a bare mixed-case identifier with no digit is
+// indistinguishable by shape alone from a genuine unquoted mixed-case secret
+// with no digit (the very next test below deliberately requires the latter to
+// stay flagged) — no regex-only signal separates the two without a dictionary.
+test('a bare mixed-case identifier with no digit is still (falsely) caught — accepted trade-off, see isPlausibleSecretValue', () => {
+  assert.strictEqual(detectsKey('API_KEY: Optional'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('an unquoted mixed-case value with no digit is still caught as a plausible secret (this is the real case the trade-off above protects)', () => {
+  assert.strictEqual(detectsGeneric('TOKEN' + '=abcDEFghi' + 'JKLmno'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('a TypeScript non-null-asserted dotted chain is NOT caught (`process.env.API_KEY!`)', () => {
+  assert.strictEqual(detectsKey('API_' + 'KEY = process.env.API_' + 'KEY!'), false);
+});
+
+test('a real password containing a literal dot AND a digit is still caught (dotted-chain rejection requires "no digit")', () => {
+  assert.strictEqual(detectsGeneric('PASSWORD' + '=Passw0rd.Secure'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('isPlausibleSecretValue is exported and both generic rules agree with it on the same value (no drift between the two copies)', () => {
+  const { isPlausibleSecretValue, SECRET_PATTERNS } = require('../src/patterns');
+  assert.strictEqual(typeof isPlausibleSecretValue, 'function');
+  const casesExpectingReject = ['settings', 'configuration', 'access_token', 'SHORTCODE'];
+  for (const value of casesExpectingReject) {
+    assert.strictEqual(isPlausibleSecretValue(value), false, `expected reject: ${value}`);
+  }
+  const casesExpectingAccept = ['"a quoted value"', 'ABCDEFGHIJKLMNOPQRSTUVWX', 'abc123DEF456'];
+  for (const value of casesExpectingAccept) {
+    assert.strictEqual(isPlausibleSecretValue(value), true, `expected accept: ${value}`);
+  }
 });
 
 test('unquoted value WITH a digit is still caught (regression, false-positive fix did not weaken real detection)', () => {
@@ -308,6 +365,61 @@ test('unquoted value WITH a digit is still caught (regression, false-positive fi
 
 test('unquoted value with mixed case but no digit is still caught (regression)', () => {
   assert.strictEqual(detectsGeneric('TOKEN' + '=abcDEFghi' + 'JKLmno'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+// ── Fix 2026-08-31: *_KEY gained a validate(), shared with the rule above ──
+// Found live: leakward-guard.sh blocked every git push out of one real
+// project (258 findings), almost all of them ordinary environment-variable
+// reads like NETTS_API_KEY = os.environ.get(...) — this rule previously had
+// no validate() at all, so ANY *_KEY assignment was flagged unconditionally.
+
+test('*_KEY assigned from an environment-variable lookup is NOT caught (the original false positive)', () => {
+  assert.strictEqual(detectsKey('NETTS_API_' + 'KEY = os.environ.get("NETTS_API_' + 'KEY", "")'), false);
+});
+
+test('*_KEY assigned from getenv() is NOT caught', () => {
+  assert.strictEqual(detectsKey('API_' + 'KEY = os.getenv("API_' + 'KEY")'), false);
+});
+
+// ── Fix 2026-08-31, round 2 (independent /validate reviewer found this) ──
+// A single `(?!\()` is not enough: when the greedy {8,} run stops right
+// before a real `(`, the engine backtracks to a one-char-shorter match, and
+// that shorter match's next character is just an ordinary identifier
+// character, not `(` — so the lookahead passes on the truncated match and
+// a mixed-case wrapper call still gets flagged. Fixed with a second,
+// maximal-munch lookahead that only the true full-length run can satisfy.
+
+test('*_KEY assigned from a mixed-case wrapper CALL is NOT caught (backtracking-defeat fix)', () => {
+  assert.strictEqual(detectsKey('SSH_' + 'KEY = getEnvOrDefault("SSH_' + 'KEY")'), false);
+});
+
+test('*_KEY assigned from a mixed-case property access (no call) is NOT caught — dotted identifier chain', () => {
+  assert.strictEqual(detectsKey('SSH_' + 'KEY = Path.home()'), false);
+});
+
+test('*_KEY assigned from process.env.* (Node-style, dotted, mixed-case) is NOT caught', () => {
+  assert.strictEqual(detectsKey('API_' + 'KEY = process.env.API_' + 'KEY'), false);
+});
+
+test('a real JWT-shaped secret with literal dots is still caught — dotted-chain rejection requires "no digit anywhere", and a JWT always has one in its base64 segments', () => {
+  assert.strictEqual(
+    detectsKey('API_' + 'KEY=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF'), // gitleaks:allow — fake fixture, not a real key
+    true
+  );
+});
+
+test('a real dotted secret is still caught with no length cap needed (the length<40 gate tried in round 2 was dead weight, dropped in round 3)', () => {
+  assert.strictEqual(
+    detectsGeneric('SECRET' + '=configuration.production.deploy.key.v2.9f8e7d6c5b4a'), // gitleaks:allow — fake fixture, not a real key
+    true
+  );
+});
+
+test('a multi-line quoted value is still caught (dropped by `.` not matching newline before this fix)', () => {
+  assert.strictEqual(
+    detectsKey('API_' + 'KEY = "aaaa1111aa\nbbbb2222bb"'), // gitleaks:allow — fake fixture, not a real key
+    true
+  );
 });
 
 test('value under 8 chars is NOT caught (length floor unchanged)', () => {
@@ -340,6 +452,30 @@ test('long alphanumeric run with no _KEY does not cause catastrophic backtrackin
   detectsKey(hostile);
   const elapsedMs = Date.now() - start;
   assert.ok(elapsedMs < 500, `expected near-linear scan time (<500ms), took ${elapsedMs}ms`);
+});
+
+// -- Round 3 ReDoS regression: the round-1/round-2 maximal-munch lookaheads --
+// Found by an independent /validate reviewer: the unquoted value branch's
+// `{8,}` (unbounded) combined with the two trailing lookaheads backtracks
+// O(n^2) on a long run of allowed characters immediately followed by `(` --
+// measured 63s on 300,000 chars before the {8,512} bound was added, versus
+// 0ms on the pre-round-1 code (which had no lookaheads to backtrack through).
+test('a long run of allowed characters ending right before "(" does not cause catastrophic backtracking (ReDoS regression)', () => {
+  const hostile = 'A_' + 'KEY=' + 'x'.repeat(120000) + '(';
+  const start = Date.now();
+  detectsKey(hostile);
+  detectsGeneric('SECRET' + '=' + 'x'.repeat(120000) + '(');
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs < 1000, `expected near-linear scan time (<1000ms), took ${elapsedMs}ms`);
+});
+
+// -- Round 3 fixes: optional chaining, and greedy separator whitespace ------
+test('optional chaining in the middle of a dotted chain is normalized and NOT caught (`process.env.API_KEY?.trim`)', () => {
+  assert.strictEqual(detectsKey('API_' + 'KEY = process.env.API_' + 'KEY?.trim'), false);
+});
+
+test('an empty value followed by a newline does not steal the next line as its value (separator whitespace is space/tab only, not newline)', () => {
+  assert.strictEqual(detectsGeneric('TOK' + 'EN=' + '\n' + 'ALERT_CHAT_ID=-5176098947'), false);
 });
 
 // ── DB connection string: ReDoS regression guard ────────────────────────
