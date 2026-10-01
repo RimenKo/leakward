@@ -349,6 +349,23 @@ test('real secret followed by a space and "[" later on the line IS still caught'
   assert.strictEqual(detectsGeneric('to' + 'ken' + ' = Ab3dEf9hIj2kLm [prod]'), true);
 });
 
+// Regression found by the independent reviewer on the first version of this fix:
+// the value runs on past a separator and only then reaches "[".
+test('secret in a query string followed by an array parameter IS still caught', () => {
+  assert.strictEqual(detectsGeneric('?to' + 'ken' + '=Ab3dEf9hIj2kLm&filter[status]=active'), true);
+  assert.strictEqual(detectsGeneric('?to' + 'ken' + '=Ab3dEf9hIj2kLm&ids[]=1'), true);
+});
+
+test('secret followed by a shell array index or path-with-index IS still caught', () => {
+  assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=Ab3dEf9hIj2kLm$arr[0]'), true);
+  assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=Ab3dEf9hIj2kLm/a[1]'), true);
+});
+
+test('secret with a digit glued straight to "[" IS still caught', () => {
+  assert.strictEqual(detectsGeneric('to' + 'ken' + '=Ab3dEf9hIj2kLm[0]'), true);
+  assert.strictEqual(detectsGeneric('to' + 'ken' + '=Ab3dEf9hIj2kLm[INFO]'), true);
+});
+
 // KNOWN LIMITATION (documented in src/patterns.js next to isPlausibleSecretValue,
 // not fixed 2026-08-31): a bare mixed-case identifier with no digit is
 // indistinguishable by shape alone from a genuine unquoted mixed-case secret
