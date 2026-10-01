@@ -319,7 +319,14 @@ const SECRET_PATTERNS = [
     // (which stops exactly at the real boundary) can satisfy both
     // lookaheads together, so backtracking has no shorter match left to
     // fall back to and the whole alternative correctly fails.
-    regex: /(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
+    // Third lookahead `(?!\[)` (found live 2026-10-01): a value glued to `[` is a
+    // generic type or a subscript, never a secret — a Python annotation such as
+    // `self._x: Optional[str] = None` was blocking edits of ordinary scripts,
+    // because the bare word before `[` is mixed-case with no digit and the
+    // `[` boundary was accepted by the lookahead above. Same reasoning as the
+    // `(?!\()` call guard; a real secret value never contains `[` (excluded
+    // from the value class above), so it never ends right before one either.
+    regex: /(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\()(?!\[))/gi,
     validate: (match) => {
       try {
         const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*/i, '');

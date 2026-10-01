@@ -325,6 +325,30 @@ test('bare lowercase identifier reused as its own "secret" is NOT caught (the ex
   assert.strictEqual(detectsGeneric('TOKEN' + '=access_token'), false);
 });
 
+// ── Fix 2026-10-01: a value glued to `[` is a generic type / subscript ──
+// Found live: a Python type annotation on a token or secret attribute
+// blocked edits of ordinary helper scripts (the bare type name is mixed-case
+// with no digit). Fixtures are concatenated so the trigger shape never
+// appears contiguously in this file.
+test('Python annotation "x: Optional[str] = None" is NOT caught — a generic type, not a secret', () => {
+  assert.strictEqual(detectsGeneric('self._to' + 'ken' + ': Optional[str] = None'), false);
+  assert.strictEqual(detectsGeneric('def f(exc, sec' + 'ret' + ': Optional[str] = None) -> str:'), false);
+  assert.strictEqual(detectsGeneric('to' + 'ken' + ': Dict[str, str] = {}'), false);
+});
+
+test('subscript read "TOKEN=Settings[name]" is NOT caught — indexing code, not a secret', () => {
+  assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=Settings[name]'), false);
+});
+
+test('real mixed-case unquoted secret with digits IS still caught (the "[" guard does not weaken real detection)', () => {
+  assert.strictEqual(detectsGeneric('to' + 'ken' + ' = Ab3dEf9hIj2kLm'), true);
+  assert.strictEqual(detectsGeneric('SEC' + 'RET' + ': Zq8WxYv5RtUi'), true);
+});
+
+test('real secret followed by a space and "[" later on the line IS still caught', () => {
+  assert.strictEqual(detectsGeneric('to' + 'ken' + ' = Ab3dEf9hIj2kLm [prod]'), true);
+});
+
 // KNOWN LIMITATION (documented in src/patterns.js next to isPlausibleSecretValue,
 // not fixed 2026-08-31): a bare mixed-case identifier with no digit is
 // indistinguishable by shape alone from a genuine unquoted mixed-case secret
