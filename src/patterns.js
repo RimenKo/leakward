@@ -334,9 +334,9 @@ const SECRET_PATTERNS = [
     validate: (match) => {
       try {
         const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/i, '');
-        // After a type annotation (`x: T = value`) an unquoted value with no digit
-        // is a variable name or expression (`const token: string = accessToken`),
-        // not a secret; a quoted value or one with a digit is still judged normally.
+        // After a type annotation (`x: T = value`) an unquoted value is
+        // a variable name or expression (`const token: string = accessToken`),
+        // not a secret; only a quoted value is judged normally.
         const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
         const prefix = match.slice(0, match.length - value.length);
         if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
@@ -380,9 +380,9 @@ const SECRET_PATTERNS = [
     validate: (match) => {
       try {
         const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/, '');
-        // After a type annotation (`x: T = value`) an unquoted value with no digit
-        // is a variable name or expression (`const token: string = accessToken`),
-        // not a secret; a quoted value or one with a digit is still judged normally.
+        // After a type annotation (`x: T = value`) an unquoted value is
+        // a variable name or expression (`const token: string = accessToken`),
+        // not a secret; only a quoted value is judged normally.
         const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
         const prefix = match.slice(0, match.length - value.length);
         if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
