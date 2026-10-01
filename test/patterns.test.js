@@ -702,5 +702,22 @@ test('BIP39 seed is still flagged when the next line is a bare leakward:allow (g
   );
 });
 
+const jwtPattern = SECRET_PATTERNS.find((p) => p.name === 'JWT secret');
+assert.ok(jwtPattern, 'JWT secret pattern not found in patterns.js');
+
+test('annotated assignment with a real value IS caught, with a None/Field default is NOT (Generic + *_KEY)', () => {
+  assert.strictEqual(detectsGeneric('pass' + 'word: Optional[str] = "Ab3dEf9hIj2kLm"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('tok' + 'en: Annotated[str, Field(min_length=3)] = "Ab3dEf9hIj2kLm"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('tok' + 'en: Optional[str] = None'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en: Optional[str] = Field(default=None)'), false);
+  assert.strictEqual(detectsKey('SECRET' + '_KEY: Optional[str] = "django-insecure-a8f9x2"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('API' + '_KEY: Optional[str] = None'), false);
+});
+
+test('JWT secret rule: long annotation is NOT caught, a real value IS', () => {
+  assert.strictEqual(detectsWith(jwtPattern, 'JWT_SEC' + 'RET: Optional[SecretStr]=Field(default=None)'), false);
+  assert.strictEqual(detectsWith(jwtPattern, 'JWT_SEC' + 'RET=abcdefghijklmnopqrstuvwxyz012345678'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
