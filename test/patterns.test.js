@@ -333,7 +333,7 @@ test('bare lowercase identifier reused as its own "secret" is NOT caught (the ex
 test('Python annotation "x: Optional[str] = None" is NOT caught — a generic type, not a secret', () => {
   assert.strictEqual(detectsGeneric('self._to' + 'ken' + ': Optional[str] = None'), false);
   assert.strictEqual(detectsGeneric('def f(exc, sec' + 'ret' + ': Optional[str] = None) -> str:'), false);
-  assert.strictEqual(detectsGeneric('to' + 'ken' + ': Dict[str, str] = {}'), false);
+  assert.strictEqual(detectsGeneric('to' + 'ken' + ': MutableMapping[str, str] = {}'), false);
 });
 
 test('subscript read "TOKEN=Settings[name]" is NOT caught — indexing code, not a secret', () => {
@@ -359,6 +359,26 @@ test('secret in a query string followed by an array parameter IS still caught', 
 test('secret followed by a shell array index or path-with-index IS still caught', () => {
   assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=Ab3dEf9hIj2kLm$arr[0]'), true);
   assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=Ab3dEf9hIj2kLm/a[1]'), true);
+});
+
+test('pydantic-style "*_KEY: Optional[str] = None" is NOT caught by the *_KEY rule either (same false positive, second rule)', () => {
+  assert.strictEqual(detectsKey('MY_API' + '_KEY: Optional[str] = None'), false);
+  assert.strictEqual(detectsKey('SECRET' + '_KEY: Optional[str] = None'), false);
+});
+
+test('*_KEY rule: real key with a digit before a "[" later in the value IS still caught', () => {
+  assert.strictEqual(detectsKey('MY_API' + '_KEY=Ab3dEf9hIj2kLm&ids[]=1'), true);
+});
+
+const azurePattern = SECRET_PATTERNS.find((p) => p.name === 'Azure client secret');
+assert.ok(azurePattern, 'Azure client secret pattern not found in patterns.js');
+test('Azure client secret rule: "Optional[str]" annotation is NOT caught, a real value IS', () => {
+  assert.strictEqual(detectsWith(azurePattern, 'AZURE_CLIENT' + '_SECRET: Optional[str] = None'), false);
+  assert.strictEqual(detectsWith(azurePattern, 'AZURE_CLIENT' + '_SECRET=Ab3dEf9hIj2kLm'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('digit-free identifier-like value with "$" before "[" IS still caught (the "$" is a separator, not part of the guard)', () => {
+  assert.strictEqual(detectsGeneric('TO' + 'KEN' + '=AbcdEfghIjkl$a[0]'), true);
 });
 
 test('secret with a digit glued straight to "[" IS still caught', () => {

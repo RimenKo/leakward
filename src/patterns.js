@@ -175,7 +175,7 @@ const SECRET_PATTERNS = [
   { name: 'AWS Access Key ID',        regex: /(?:AKIA|ASIA)[0-9A-Z]{16}/g },
   { name: 'AWS Secret Access Key',    regex: /(?:aws[_\-]?secret[_\-]?(?:access[_\-]?)?key)\s*[=:]\s*["']?[A-Za-z0-9\/+=]{40}["']?/gi },
   { name: 'GCP service account',      regex: /"type"\s*:\s*"service_account"/g },
-  { name: 'Azure client secret',      regex: /(?:AZURE[_\-]?CLIENT[_\-]?SECRET)\s*[=:]\s*["']?[^\s"']{8,}["']?/gi },
+  { name: 'Azure client secret',      regex: /(?:AZURE[_\-]?CLIENT[_\-]?SECRET)\s*[=:]\s*["']?(?![A-Za-z_.]+\[)[^\s"']{8,}["']?/gi },
   { name: 'DigitalOcean token',       regex: /dop_v1_[a-zA-Z0-9]{43}/g },
   { name: 'Cloudflare API token',     regex: /(?:CF[_\-]?(?:API[_\-]?)?TOKEN)\s*[=:]\s*["']?[A-Za-z0-9_\-]{40,}["']?/gi },
   { name: 'Cloudflare Global Key',    regex: /(?:CF[_\-]?(?:API[_\-]?)?KEY)\s*[=:]\s*["']?[a-f0-9]{37}["']?/gi },
@@ -319,8 +319,8 @@ const SECRET_PATTERNS = [
     // (which stops exactly at the real boundary) can satisfy both
     // lookaheads together, so backtracking has no shorter match left to
     // fall back to and the whole alternative correctly fails.
-    // Leading guard `(?![A-Za-z_$.]+\[)` on the unquoted value (found live
-    // 2026-10-01): a value that is a bare identifier (letters, `_`, `$`, `.`,
+    // Leading guard `(?![A-Za-z_.]+\[)` on the unquoted value (found live
+    // 2026-10-01): a value that is a bare identifier (letters, `_`, `.`,
     // NO digit) glued straight to `[` is a generic type or a subscript — a Python
     // annotation such as `self._x: Optional[str] = None` was blocking edits of
     // ordinary scripts. It is deliberately NOT a blanket "no `[` after the value"
@@ -330,7 +330,7 @@ const SECRET_PATTERNS = [
     // independent reviewer the same day. A real secret carries a digit, or a
     // separator before the `[`, so it still matches; only a digit-free,
     // separator-free identifier run directly followed by `[` is dropped.
-    regex: /(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_$.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
+    regex: /(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
     validate: (match) => {
       try {
         const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)[ \t]*[=:][ \t]*/i, '');
@@ -369,7 +369,7 @@ const SECRET_PATTERNS = [
     // environment-variable reads, zero real secrets among them).
     // validate() uses the shared isPlausibleSecretValue() (this rule
     // previously had no validate() at all).
-    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
+    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
     validate: (match) => {
       try {
         const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?[ \t]*[=:][ \t]*/, '');
