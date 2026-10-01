@@ -338,7 +338,9 @@ const SECRET_PATTERNS = [
         // is a variable name or expression (`const token: string = accessToken`),
         // not a secret; a quoted value or one with a digit is still judged normally.
         const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
-        if (annotated && !/^["']/.test(value) && !/\d/.test(value)) return false;
+        const prefix = match.slice(0, match.length - value.length);
+        if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
+        if (annotated && !/^["']/.test(value)) return false;
         return isPlausibleSecretValue(value);
       } catch (_) { return true; }
     },
@@ -382,7 +384,9 @@ const SECRET_PATTERNS = [
         // is a variable name or expression (`const token: string = accessToken`),
         // not a secret; a quoted value or one with a digit is still judged normally.
         const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
-        if (annotated && !/^["']/.test(value) && !/\d/.test(value)) return false;
+        const prefix = match.slice(0, match.length - value.length);
+        if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
+        if (annotated && !/^["']/.test(value)) return false;
         return isPlausibleSecretValue(value);
       } catch (_) { return true; }
     },

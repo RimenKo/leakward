@@ -733,5 +733,18 @@ test('a ":" inside the value after no annotation still reaches validate with the
   assert.strictEqual(detectsGeneric('SEC' + 'RET:AbcDefGh:abcdefgh'), true); // gitleaks:allow — fake fixture, not a real key
 });
 
+test('after an annotation an unquoted identifier is never a secret, even with a digit in the name', () => {
+  assert.strictEqual(detectsGeneric('self.tok' + 'en: str = token_v2'), false);
+  assert.strictEqual(detectsGeneric('const sec' + 'ret: string = process.env.APP_SECRET_2!;'), false);
+  assert.strictEqual(detectsKey('AWS_SECRET' + '_KEY: str = settings.AWS_S3_SECRET'), false);
+  assert.strictEqual(detectsGeneric('const tok' + 'en: string = base64Token;'), false);
+});
+
+test('a bare type glued to "=" is the old "name: value" shape, whole value is judged', () => {
+  assert.strictEqual(detectsGeneric('pass' + 'word: Abc=DefGhiJk'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('pass' + 'word: admin=12345678'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('tok' + 'en: Optional[str]=None'), false);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
