@@ -719,5 +719,19 @@ test('JWT secret rule: long annotation is NOT caught, a real value IS', () => {
   assert.strictEqual(detectsWith(jwtPattern, 'JWT_SEC' + 'RET=abcdefghijklmnopqrstuvwxyz012345678'), true); // gitleaks:allow — fake fixture, not a real key
 });
 
+test('annotation forms: nested generics and PEP 604 unions with a real value are caught; "name = identifier" after an annotation is not', () => {
+  assert.strictEqual(detectsGeneric('pass' + 'word: Optional[Union[str, bytes]] = "Ab3dEf9hIjKlMn42"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('pass' + 'word: str | None = "Ab3dEf9hIjKlMn42"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('SECRET' + '_KEY: str | None = "django-insecure-a8f9x2"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('const tok' + 'en: string = accessToken;'), false);
+  assert.strictEqual(detectsGeneric('let pass' + 'word: string = newPassword;'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en: Optional[Dict[str, str]] = None'), false);
+});
+
+test('a ":" inside the value after no annotation still reaches validate with the whole value (no annotation path)', () => {
+  assert.strictEqual(detectsGeneric('pass' + 'word: CorrectHorse:battery'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('SEC' + 'RET:AbcDefGh:abcdefgh'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

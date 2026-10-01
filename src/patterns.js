@@ -330,10 +330,15 @@ const SECRET_PATTERNS = [
     // independent reviewer the same day. A real secret carries a digit, or a
     // separator before the `[`, so it still matches; only a digit-free,
     // separator-free identifier run directly followed by `[` is dropped.
-    regex: /(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[[^\]\n]{0,64}\])*)?[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
+    regex: /(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
     validate: (match) => {
       try {
-        const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[[^\]\n]{0,64}\])*)?[ \t]*[=:][ \t]*/i, '');
+        const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/i, '');
+        // After a type annotation (`x: T = value`) an unquoted value with no digit
+        // is a variable name or expression (`const token: string = accessToken`),
+        // not a secret; a quoted value or one with a digit is still judged normally.
+        const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
+        if (annotated && !/^["']/.test(value) && !/\d/.test(value)) return false;
         return isPlausibleSecretValue(value);
       } catch (_) { return true; }
     },
@@ -369,10 +374,15 @@ const SECRET_PATTERNS = [
     // environment-variable reads, zero real secrets among them).
     // validate() uses the shared isPlausibleSecretValue() (this rule
     // previously had no validate() at all).
-    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[[^\]\n]{0,64}\])*)?[ \t]*[=:][ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
+    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
     validate: (match) => {
       try {
-        const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[[^\]\n]{0,64}\])*)?[ \t]*[=:][ \t]*/, '');
+        const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/, '');
+        // After a type annotation (`x: T = value`) an unquoted value with no digit
+        // is a variable name or expression (`const token: string = accessToken`),
+        // not a secret; a quoted value or one with a digit is still judged normally.
+        const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
+        if (annotated && !/^["']/.test(value) && !/\d/.test(value)) return false;
         return isPlausibleSecretValue(value);
       } catch (_) { return true; }
     },
