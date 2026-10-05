@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// Hook script for Claude Code PostToolUse (Bash).
+// Hook script for Claude Code PostToolUse (Bash and the Playwright/Gmail MCP tools).
 // The write-time hook guards what goes INTO files; this one guards what comes
 // OUT of commands: a `creds.sh get ...` or `cat .env` prints the secret into
 // the tool result, and from there into the transcript and any logs of it.
@@ -14,6 +14,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 let SECRET_PATTERNS;
 try {
@@ -38,8 +39,48 @@ const JSON_FIELD = new RegExp(`("[A-Za-z0-9_.-]*${SECRET_KEY_NAME}[A-Za-z0-9_.-]
 // slowing every Bash call.
 const MAX_TEXT_BYTES = 1024 * 1024;
 
+// Exact values from the local credential store. Pattern matching cannot see a
+// provider key that has no recognisable prefix (a bare 32-char token), so any
+// stored secret is also redacted by its literal value, wherever it shows up.
+// Values shorter than this are skipped: too many ordinary words would match.
+const MIN_KNOWN_SECRET_LEN = 12;
+const SECRET_FIELD = new RegExp(SECRET_KEY_NAME, 'i');
+
+function loadKnownSecrets() {
+  const file = process.env.LEAKWARD_CRED_DB || path.join(os.homedir(), '.claude', 'credentials', 'db.json');
+  let db;
+  try {
+    db = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return [];
+  }
+  const found = new Map();
+  const walk = (node, label) => {
+    if (node == null) return;
+    if (typeof node === 'string') {
+      const field = label.split('/').pop();
+      if (node.length >= MIN_KNOWN_SECRET_LEN && SECRET_FIELD.test(field) && !found.has(node)) {
+        found.set(node, `cred:${label}`);
+      }
+      return;
+    }
+    if (typeof node !== 'object') return;
+    for (const [k, v] of Object.entries(node)) walk(v, label ? `${label}/${k}` : k);
+  };
+  walk(db.services || db, '');
+  // Longest first so a secret that contains a shorter one is replaced whole.
+  return [...found.entries()].sort((a, b) => b[0].length - a[0].length);
+}
+
+const KNOWN_SECRETS = loadKnownSecrets();
+
 function redactText(text, hits) {
   let out = text;
+  for (const [value, name] of KNOWN_SECRETS) {
+    if (!out.includes(value)) continue;
+    out = out.split(value).join(`[REDACTED:${name}]`);
+    hits.push('stored credential');
+  }
   for (const { name, regex, validate } of SECRET_PATTERNS) {
     if (SKIP_IN_OUTPUT.test(name)) continue;
     regex.lastIndex = 0;
@@ -72,20 +113,24 @@ try {
   if (resp == null) process.exit(0);
 
   const hits = [];
-  let updated;
-  if (typeof resp === 'string') {
-    if (Buffer.byteLength(resp, 'utf8') > MAX_TEXT_BYTES) process.exit(0);
-    updated = redactText(resp, hits);
-  } else if (typeof resp === 'object') {
-    updated = { ...resp };
-    for (const field of ['stdout', 'stderr', 'output', 'content']) {
-      if (typeof resp[field] !== 'string') continue;
-      if (Buffer.byteLength(resp[field], 'utf8') > MAX_TEXT_BYTES) continue;
-      updated[field] = redactText(resp[field], hits);
+  // Bash returns {stdout, stderr}; MCP tools (Playwright, Gmail) return
+  // content blocks like [{type: 'text', text}] or {content: [...]}. Walking
+  // every string keeps whatever shape the tool used and covers both.
+  const redactTree = (node) => {
+    if (typeof node === 'string') {
+      if (Buffer.byteLength(node, 'utf8') > MAX_TEXT_BYTES) return node;
+      return redactText(node, hits);
     }
-  } else {
-    process.exit(0);
-  }
+    if (Array.isArray(node)) return node.map(redactTree);
+    if (node && typeof node === 'object') {
+      const copy = {};
+      for (const [k, v] of Object.entries(node)) copy[k] = redactTree(v);
+      return copy;
+    }
+    return node;
+  };
+  if (typeof resp !== 'string' && typeof resp !== 'object') process.exit(0);
+  const updated = redactTree(resp);
 
   if (hits.length === 0) process.exit(0);
 

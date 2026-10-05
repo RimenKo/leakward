@@ -69,6 +69,43 @@ function ok(label) { console.log(`✓ ${label}`); passed++; }
   ok('short field value / plain prose → untouched');
 }
 
+// A stored credential with no recognisable shape (bare 32-char token) is
+// redacted by its exact value, in Bash output and in MCP content blocks
+{
+  const fs = require('fs');
+  const os = require('os');
+  const dbFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lw-')), 'db.json');
+  const BARE = 'Kq8' + 'Zr2Wm5Xt9Bn3Vc7Ld1Hs4Fg6Jp0Ye';
+  const SHORT = 'tiny';
+  fs.writeFileSync(dbFile, JSON.stringify({ services: { 'dash.example.io': { [FIELD]: BARE, email: 'a@b.co', password: SHORT } } }));
+  const runWithDb = (tool, toolResponse) => spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify({ tool_name: tool, tool_response: toolResponse }),
+    encoding: 'utf8',
+    env: { ...process.env, LEAKWARD_CRED_DB: dbFile },
+  });
+
+  let out = updatedOf(runWithDb('Bash', { stdout: `key is ${BARE} ok`, stderr: '' }));
+  assert.ok(!out.updatedToolOutput.stdout.includes(BARE));
+  assert.ok(out.updatedToolOutput.stdout.includes('[REDACTED:cred:dash.example.io/' + FIELD + ']'));
+  ok('bare stored credential in Bash stdout → redacted by exact value');
+
+  out = updatedOf(runWithDb('mcp__playwright__browser_run_code_unsafe', [{ type: 'text', text: `"result": "${BARE}"` }, { type: 'image', data: 'abc' }]));
+  assert.ok(Array.isArray(out.updatedToolOutput));
+  assert.ok(!JSON.stringify(out.updatedToolOutput).includes(BARE));
+  assert.strictEqual(out.updatedToolOutput[1].type, 'image');
+  ok('MCP content array → redacted, structure preserved');
+
+  out = updatedOf(runWithDb('mcp__playwright__browser_snapshot', { content: [{ type: 'text', text: `dialog: remove ${BARE} ?` }], isError: false }));
+  assert.ok(!JSON.stringify(out.updatedToolOutput).includes(BARE));
+  assert.strictEqual(out.updatedToolOutput.isError, false);
+  ok('MCP {content:[...]} object → redacted, other fields preserved');
+
+  const r = runWithDb('Bash', { stdout: `the word ${SHORT} and ${'a@b.co'} stay`, stderr: '' });
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(r.stdout, '');
+  ok('short stored value / email field are not treated as secrets');
+}
+
 // Malformed stdin fails open
 {
   const r = spawnSync(process.execPath, [HOOK], { input: 'not json', encoding: 'utf8' });
