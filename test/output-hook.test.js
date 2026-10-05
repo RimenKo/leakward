@@ -77,7 +77,8 @@ function ok(label) { console.log(`✓ ${label}`); passed++; }
   const dbFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lw-')), 'db.json');
   const BARE = 'Kq8' + 'Zr2Wm5Xt9Bn3Vc7Ld1Hs4Fg6Jp0Ye';
   const SHORT = 'tiny';
-  fs.writeFileSync(dbFile, JSON.stringify({ services: { 'dash.example.io': { [FIELD]: BARE, email: 'a@b.co', password: SHORT } } }));
+  const BRAND = 'Example Brand Team';
+  fs.writeFileSync(dbFile, JSON.stringify({ services: { 'dash.example.io': { [FIELD]: BARE, email: 'a@b.co', password: SHORT, author_name: BRAND } } }));
   const runWithDb = (tool, toolResponse) => spawnSync(process.execPath, [HOOK], {
     input: JSON.stringify({ tool_name: tool, tool_response: toolResponse }),
     encoding: 'utf8',
@@ -104,6 +105,11 @@ function ok(label) { console.log(`✓ ${label}`); passed++; }
   assert.strictEqual(r.status, 0);
   assert.strictEqual(r.stdout, '');
   ok('short stored value / email field are not treated as secrets');
+
+  const rb = runWithDb('Bash', { stdout: `posted by ${BRAND}`, stderr: '' });
+  assert.strictEqual(rb.status, 0);
+  assert.strictEqual(rb.stdout, '');
+  ok('author_name (contains "auth") is not a secret field');
 }
 
 // Malformed stdin fails open

@@ -44,7 +44,10 @@ const MAX_TEXT_BYTES = 1024 * 1024;
 // stored secret is also redacted by its literal value, wherever it shows up.
 // Values shorter than this are skipped: too many ordinary words would match.
 const MIN_KNOWN_SECRET_LEN = 12;
-const SECRET_FIELD = new RegExp(SECRET_KEY_NAME, 'i');
+// Narrower than SECRET_KEY_NAME on purpose: a bare "auth" there also matches
+// "author_name", and masking a brand name in every output is worse than the
+// pattern layer's occasional over-redaction of a JSON dump.
+const SECRET_FIELD = /pass(?:word|wd)?|secret|token|api[_-]?key|apikey|private[_-]?key|access[_-]?key|client[_-]?secret|auth[_-]?(?:token|key|hash)/i;
 
 function loadKnownSecrets() {
   const file = process.env.LEAKWARD_CRED_DB || path.join(os.homedir(), '.claude', 'credentials', 'db.json');
