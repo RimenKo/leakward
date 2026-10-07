@@ -20,7 +20,7 @@
     "aiguard": "bin/leakward.js"
   },
   "scripts": {
-    "test": "node test/patterns.test.js && node test/scanner.test.js && node test/hook.test.js && node test/output-hook.test.js && node test/resolve-hook-path.test.js",
+    "test": "node test/patterns.test.js && node test/scanner.test.js && node test/hook.test.js && node test/output-hook.test.js && node test/resolve-hook-path.test.js && node test/redact.test.js",
     "prepublishOnly": "node bin/leakward.js --npm-only"
   },
   "files": [

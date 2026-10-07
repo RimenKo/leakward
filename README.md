@@ -260,6 +260,27 @@ chmod +x .git/hooks/pre-commit
 
 ---
 
+## Redact secrets out of command logs (library)
+
+`src/redact.js` masks secrets in a block of text, for example a shell command
+before it is written to a log:
+
+```js
+const { redactText } = require('@rimenko-dev/leakward/src/redact');
+const { text, contextOk, patternsLoaded } = redactText(commandText);
+```
+
+Two layers run in order. A context layer masks a password by where it sits in
+a command (`curl -u user:pass`, `Authorization: Basic ...`,
+`https://user:pass@host`, `sshpass -p`, `mysql -pPASS`, `docker login -p`,
+`--password=...`, `PGPASSWORD=...` and other `*_PASSWORD` env assignments);
+then the shape-based `SECRET_PATTERNS` catalog runs. Only the secret value is
+replaced, with `***[length]`; `$VAR` and `$(cmd)` values are left alone and the
+pass is idempotent. `redactText` never throws: `contextOk` / `patternsLoaded`
+tell the caller whether a layer failed.
+
+---
+
 ## Severity levels
 
 | Level | Meaning | Blocks publish? |
