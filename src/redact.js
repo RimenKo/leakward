@@ -5,7 +5,8 @@
 // (maskContextSecrets): a password has no shape of its own, so it is found by
 // WHERE it sits in a command (curl -u user:pass, Authorization: Basic ...,
 // https://user:pass@host, sshpass -p, mysql -pPASS, --password=...,
-// PGPASSWORD=...) and only that value is masked. Then the shape-based
+// PGPASSWORD=..., redis-cli -a, zip -P, 7z -pPASS, curl -d password=...) and
+// only that value is masked. Then the shape-based
 // SECRET_PATTERNS catalog from ./patterns.
 // Out of scope: reading stdin, printing, exit codes and locating this package
 // (the caller owns them), and command text that merely mentions a secret
@@ -33,10 +34,13 @@ function isLiteralSecret(value) {
 }
 
 // End of the shell command that starts before index i: the first unquoted
-// ; | & or newline. A backslash-newline continues the command. One forward
-// scan, so a long line costs linear time.
+// ; | & or newline. A backslash-newline continues the command. A ; | & or
+// newline inside a $( ... ) command substitution belongs to that substitution,
+// not to this command, so it does not end the segment. One forward scan with
+// a depth counter, so a long line costs linear time.
 function segmentEnd(text, i) {
   const n = text.length;
+  let depth = 0;
   // The command word itself sits inside a quoted string: 'curl', "don't use curl".
   if (text[i] === "'" || text[i] === '"') return i;
   while (i < n) {
@@ -56,7 +60,16 @@ function segmentEnd(text, i) {
       i += 1;
       while (i < n && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
       i += 1;
-    } else if (c === ';' || c === '|' || c === '&' || c === '\n') {
+    } else if (c === '$' && text[i + 1] === '(') {
+      depth += 1;
+      i += 2;
+    } else if (depth > 0 && c === '(') {
+      depth += 1; // $(( arithmetic, nested ( ) inside a substitution
+      i += 1;
+    } else if (depth > 0 && c === ')') {
+      depth -= 1;
+      i += 1;
+    } else if ((c === ';' || c === '|' || c === '&' || c === '\n') && depth === 0) {
       return i;
     } else {
       i += 1;
@@ -80,24 +93,37 @@ function inSegments(text, startSource, fn) {
   return out + text.slice(last);
 }
 
-// One shell word: 'single', "double" or bare. Groups 1-3 hold the inner text.
-const WORD = String.raw`(?:'([^']*)'|"([^"]*)"|([^\s'"]\S*))`;
+// One shell word, as the shell reads it: a run of 'single' or "double" quoted
+// pieces, backslash escapes (\ plus a space is part of the word) and bare
+// characters, with no unquoted whitespace between them. So "USER":PASS and
+// pa\ ss are one word each. Group 1 holds the raw word. Every piece is
+// unambiguous (no nested quantifier over the same text), so a miss costs
+// linear time.
+const WORD = String.raw`((?:'[^']*'|"[^"\\]*(?:\\[\s\S][^"\\]*)*"|[^\s'"\\]+|\\[\s\S])+)`;
 
-function wordParts(m1, m2, m3) {
-  if (m1 !== undefined) return { inner: m1, open: "'", close: "'" };
-  if (m2 !== undefined) return { inner: m2, open: '"', close: '"' };
-  return { inner: m3, open: '', close: '' };
+// Splits a raw word into the part a transform sees (inner) and the quote
+// characters that surround it and must be put back unchanged.
+function wordParts(raw) {
+  const q = raw[0];
+  if ((q === "'" || q === '"') && raw.length > 1) {
+    if (raw[raw.length - 1] === q) {
+      return { inner: raw.slice(1, -1), open: q, close: q };
+    }
+    return { inner: raw.slice(1), open: q, close: '' };
+  }
+  return { inner: raw, open: '', close: '' };
 }
 
 // prefix: regex source ending right before the value word.
-// transform(inner) -> new inner (or the same string to leave it untouched).
+// transform(inner, open) -> new inner (or the same string to leave it untouched);
+// open is the opening quote of the word ('', ' or ").
 function replaceWord(text, prefix, transform) {
   // Case-sensitive on purpose: -P is a port for mysql, -p a password, and env
   // names are upper-case, while code that mentions "password=" is not a secret.
   const re = new RegExp(`(${prefix})${WORD}`, 'g');
-  return text.replace(re, (all, pre, m1, m2, m3) => {
-    const { inner, open, close } = wordParts(m1, m2, m3);
-    const next = transform(inner);
+  return text.replace(re, (all, pre, raw) => {
+    const { inner, open, close } = wordParts(raw);
+    const next = transform(inner, open);
     return next === inner ? all : `${pre}${open}${next}${close}`;
   });
 }
@@ -115,6 +141,26 @@ function userPassSecret(inner) {
   return `${inner.slice(0, idx + 1)}${maskSecret(pass)}`;
 }
 
+// Password-like key names in a request body: password, passwd, passphrase, pwd
+// (also as a suffix: new_password, user[password]) or exactly pass.
+const KEY = String.raw`(?:[\w.\[\]-]*(?:password|passwd|passphrase|pwd)|pass)\]?`;
+const FORM_PAIR = new RegExp(String.raw`(^|&)(${KEY}=)([^&]*)`, 'gi');
+const JSON_PAIR = new RegExp(String.raw`("${KEY}"\s*:\s*")((?:[^"\\]|\\[\s\S])*)(")`, 'gi');
+// Inside a double-quoted shell word the JSON quotes are written \".
+const JSON_PAIR_ESC = new RegExp(String.raw`(\\"${KEY}\\"\s*:\s*\\")((?:[^\\]|\\(?!"))*)(\\")`, 'gi');
+
+// A request body (curl -d / --data*, -F, wget --post-data): masks the value of
+// every password-like key, as form pairs (a=1&password=x) or JSON strings.
+function bodySecret(inner, open) {
+  const pairs = (all, pre, key, value) =>
+    (isLiteralSecret(value) ? `${pre}${key}${maskSecret(value)}` : all);
+  const json = (all, pre, value, post) =>
+    (isLiteralSecret(value) ? `${pre}${maskSecret(value)}${post}` : all);
+  return inner
+    .replace(FORM_PAIR, pairs)
+    .replace(open === '"' ? JSON_PAIR_ESC : JSON_PAIR, json);
+}
+
 function maskContextSecrets(input) {
   let text = input;
 
@@ -125,12 +171,24 @@ function maskContextSecrets(input) {
       String.raw`\s(?:-[A-Za-z]*[uU]|--user|--proxy-user)(?:\s+|=)`,
       userPassSecret,
     );
-    return replaceWord(
+    seg = replaceWord(
       seg,
       String.raw`\s-[A-Za-z]*[uU](?=['"]|[^\s'"=-]+:)`,
       userPassSecret,
     );
+    // -d / --data / --data-raw|binary|urlencode|ascii / --json / -F / --form
+    seg = replaceWord(
+      seg,
+      String.raw`\s(?:-[A-Za-z]*d|--data(?:-raw|-binary|-urlencode|-ascii)?|--json|-F|--form(?:-string)?)(?:\s+|=)`,
+      bodySecret,
+    );
+    return replaceWord(seg, String.raw`\s-d(?=[^\s=-])`, bodySecret);
   });
+
+  // wget --post-data / --body-data
+  text = inSegments(text, String.raw`\bwget\b`, (seg) =>
+    replaceWord(seg, String.raw`\s--(?:post|body)-data(?:=|\s+)`, bodySecret),
+  );
 
   // Authorization: Basic|Bearer|Token <value> (also Proxy-Authorization).
   text = text.replace(
@@ -147,14 +205,37 @@ function maskContextSecrets(input) {
     (all, pre, pass) => (isLiteralSecret(pass) ? `${pre}${maskSecret(pass)}@` : all),
   );
 
-  // sshpass [-flags] -p PASS
-  text = replaceWord(text, String.raw`\bsshpass\s+(?:-[A-Za-oq-z]+\s+)*-p\s*`, wholeSecret);
+  // sshpass [-flags] [-P prompt] [-f file] [-d fd] -p PASS. The flag class
+  // excludes p, P, f and d, and a prompt word cannot start with a quote it
+  // does not own, so each option parses one way (no backtracking blow-up).
+  const SSHPASS_ARG = String.raw`(?:'[^']*'|"[^"\\]*(?:\\[\s\S][^"\\]*)*"|[^\s'"]\S*)`;
+  text = replaceWord(
+    text,
+    String.raw`\bsshpass\s+(?:(?:-[A-OQ-Zabceg-oq-z]+|-[Pfd]\s*${SSHPASS_ARG})\s+)*-p\s*`,
+    wholeSecret,
+  );
 
   // mysql family: -pPASS attached (a bare -p prompts and carries no secret).
   text = inSegments(
     text,
     String.raw`\b(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlcheck|mariadb|mariadb-dump)\b`,
     (seg) => replaceWord(seg, String.raw`\s-p(?=[^\s=\-])`, wholeSecret),
+  );
+
+  // redis-cli -a PASS / --pass PASS. A command word, not a file name like a.zip.
+  text = inSegments(text, String.raw`(?<![\w.-])redis-cli(?=\s)`, (seg) =>
+    replaceWord(seg, String.raw`\s(?:-a|--pass)(?:\s+|=)`, wholeSecret),
+  );
+
+  // zip / unzip -P PASS (also in a flag cluster: -rP PASS, or attached -PPASS).
+  text = inSegments(text, String.raw`(?<![\w.-])(?:un)?zip(?=\s)`, (seg) => {
+    seg = replaceWord(seg, String.raw`\s-[A-Za-z]*P\s+`, wholeSecret);
+    return replaceWord(seg, String.raw`\s-P(?=[^\s=-])`, wholeSecret);
+  });
+
+  // 7z / 7za / 7zr / 7zz a|x ... -pPASS (attached only; a bare -p prompts).
+  text = inSegments(text, String.raw`(?<![\w.-])7z[arz]?(?=\s)`, (seg) =>
+    replaceWord(seg, String.raw`\s-p(?=[^\s=-])`, wholeSecret),
   );
 
   // docker login ... -p PASS (or -pPASS)

@@ -227,6 +227,148 @@ for (const input of UNCHANGED3) {
   check(`unchanged3: ${JSON.stringify(input)}`, () => assert.strictEqual(run(input).out, input));
 }
 
+// ---- round 3: residues listed by the independent reviewer ----
+// 1 quoted user, secret outside the quotes; 2 backslash-escaped space in an
+// env value; 3 sshpass -P prompt before -p; 4 ; && || & inside $( ... ) before
+// the secret; 5 redis-cli -a; 6 zip -P; 7 7z -pPASS; 8 request bodies.
+// Values are short and odd on purpose: the shape layer already catches long
+// plain tokens after a password key, so only the context layer can cover these.
+const MASKED4 = [
+  ['curl -u "USER":PASS', 'curl -u "USER"§SynthR1Pw https://h.example.test/', ['SynthR1Pw'], ['curl -u "USER":', 'https://h.example.test/']],
+  ["curl -u 'USER':PASS", "curl -u 'USER'§SynthR1bPw https://h.example.test/", ['SynthR1bPw'], ["curl -u 'USER':"]],
+  ['curl -u USER:"PASS with space"', 'curl -u USER§"Synth R1c Pw" https://h.example.test/', ['Synth R1c Pw', 'R1c'], ['curl -u USER:', 'https://h.example.test/']],
+  ['curl --user "USER":PASS', 'curl --user "USER"§SynthR1dPw https://h.example.test/', ['SynthR1dPw'], ['--user "USER":']],
+  ['env value with escaped space', `PG${W}¤pa\\¦SynthR2Pw psql -h h.example.test`, ['SynthR2Pw', 'pa\\'], ['psql -h h.example.test']],
+  ['export env with several escaped spaces', `export DB_${W}=a\\ b\\ SynthR2bPw && ./run.sh`, ['SynthR2bPw', 'a\\ b'], [`export DB_${W}=`, '&& ./run.sh']],
+  ['env value quoted piece then bare', `PG${W}¤"Synth R2c"Pw1 psql`, ['Synth R2c', 'Pw1'], [' psql']],
+  ['sshpass -P prompt -p', 'sshpass -P assword -p SynthR3Pw ssh root@h.example.test uptime', ['SynthR3Pw'], ['sshpass -P assword -p ', 'ssh root@h.example.test uptime']],
+  ['sshpass -P quoted prompt -p', "sshpass -P 'pass prompt' -p SynthR3bPw ssh root@h.example.test", ['SynthR3bPw'], ["-P 'pass prompt' -p "]],
+  ['sshpass -v -P prompt -p', 'sshpass -v -P assword -p SynthR3cPw ssh root@h.example.test', ['SynthR3cPw'], ['sshpass -v -P assword -p ']],
+  ['sshpass -Pprompt attached -p', 'sshpass -Password -p SynthR3dPw ssh root@h.example.test', ['SynthR3dPw'], ['sshpass -Password -p ']],
+  ['$( && ) before curl -u', 'curl -s $(echo a && echo b) -u USER§SynthR4aPw https://h.example.test', ['SynthR4aPw'], ['$(echo a && echo b)', 'https://h.example.test']],
+  ['$( ; ) before mysql -p', 'mysql -e $(echo a; echo b) -u root -pSynthR4bPw app', ['SynthR4bPw'], ['$(echo a; echo b)', ' app']],
+  ['$( || ) before docker login -p', 'docker login $(true || false) -u u -p SynthR4cPw registry.example.test', ['SynthR4cPw'], ['$(true || false)', 'registry.example.test']],
+  ['$(( )) and & inside $( )', 'curl $(echo $((1+2)) & echo z) -u USER§SynthR4dPw https://h.example.test', ['SynthR4dPw'], ['$(echo $((1+2)) & echo z)']],
+  ['$( | ) before curl -u', 'curl $(cat u.txt | head -1) -u USER§SynthR4ePw https://h.example.test', ['SynthR4ePw'], ['$(cat u.txt | head -1)']],
+  ['redis-cli -a', 'redis-cli -h h.example.test -a SynthR5Pw get k', ['SynthR5Pw'], ['redis-cli -h h.example.test -a ', 'get k']],
+  ['redis-cli -a quoted', "redis-cli -a 'Synth R5b Pw' get k", ['Synth R5b Pw'], ["redis-cli -a '", 'get k']],
+  ['redis-cli --pass', 'redis-cli --pass SynthR5cPw get k', ['SynthR5cPw'], ['redis-cli --pass ']],
+  ['zip -P', 'zip -P SynthR6Pw out.zip dir', ['SynthR6Pw'], ['zip -P ', 'out.zip dir']],
+  ['zip long flag', `zip --${w} SynthR6bPw out.zip dir`, ['SynthR6bPw'], [`zip --${w} `, 'out.zip dir']],
+  ['zip -rP cluster', 'zip -rP SynthR6cPw out.zip dir', ['SynthR6cPw'], ['zip -rP ', 'out.zip dir']],
+  ['zip -P after the file list', 'zip -r out.zip dir -P SynthR6dPw', ['SynthR6dPw'], ['zip -r out.zip dir -P ']],
+  ['zip -PPASS attached', 'zip -PSynthR6ePw out.zip dir', ['SynthR6ePw'], ['zip -P', 'out.zip dir']],
+  ['unzip -P', 'unzip -P SynthR6fPw out.zip -d /tmp/x', ['SynthR6fPw'], ['unzip -P ', 'out.zip -d /tmp/x']],
+  ['7z a -pPASS', '7z a -pSynthR7Pw out.7z file', ['SynthR7Pw'], ['7z a -p', 'out.7z file']],
+  ['7z x -pPASS', '7z x -pSynthR7bPw out.7z -o/tmp/out', ['SynthR7bPw'], ['7z x -p', 'out.7z -o/tmp/out']],
+  ['7za quoted -p', "7za a -p'Synth R7c Pw' out.7z f", ['Synth R7c Pw'], ["7za a -p'", 'out.7z f']],
+  ['7zz -pPASS between options', '7zz a -mx=9 -pSynthR7dPw -mhe=on out.7z f', ['SynthR7dPw'], ['-mx=9 -p', '-mhe=on out.7z f']],
+  ['curl --data key=value', `curl --data ${w}¤Sh8aP https://h.example.test`, ['Sh8aP'], [`--data ${w}=`, 'https://h.example.test']],
+  ['curl --data-urlencode "key=value"', `curl --data-urlencode "${w}¤Sh8bP" https://h.example.test`, ['Sh8bP'], [`--data-urlencode "${w}=`]],
+  ["curl -d 'key=value'", `curl -d '${w}¤Sh8cP' https://h.example.test`, ['Sh8cP'], [`-d '${w}=`]],
+  ['curl -d several pairs', `curl -d 'user¤bob&${w}¤Sh8dP&x¤1' https://h.example.test`, ['Sh8dP'], ['user=bob&', '&x=1']],
+  ['curl -d value with special characters', `curl -d '${w}¤x8e,y;z!' https://h.example.test`, ['x8e,y;z!'], [`-d '${w}=`]],
+  ['curl -d attached', `curl -d'${w}¤Sh8fP' https://h.example.test`, ['Sh8fP'], [`-d'${w}=`]],
+  ['curl -sd cluster', `curl -sd '${w}¤Sh8gP' https://h.example.test`, ['Sh8gP'], [`-sd '${w}=`]],
+  ['curl --data-raw bare', `curl --data-raw ${w}¤Sh8hP https://h.example.test`, ['Sh8hP'], [`--data-raw ${w}=`]],
+  ['curl -d suffix key new_*', `curl -d 'new_${w}¤Sh8iP' https://h.example.test`, ['Sh8iP'], [`new_${w}=`]],
+  ['curl -d bracket key user[*]', `curl -d 'user[${w}]¤Sh8jP' https://h.example.test`, ['Sh8jP'], [`user[${w}]=`]],
+  ['curl -d key pass', "curl -d 'user¤a&pass¤Sh8kP' https://h.example.test", ['Sh8kP'], ['user=a&pass=']],
+  ['curl -d JSON', `curl -d '{"${w}":"Sh8lP"}' https://h.example.test`, ['Sh8lP'], [`{"${w}":"`]],
+  ['curl -d JSON with spaces and other fields', `curl -d '{"user": "bob", "${w}" : "Sh 8m P"}' https://h.example.test`, ['Sh 8m P'], ['"user": "bob"']],
+  ['curl -d JSON in a double-quoted word', `curl -d "{\\"${w}\\":\\"Sh8nP\\"}" https://h.example.test`, ['Sh8nP'], [`{\\"${w}\\":\\"`]],
+  ['curl --json', `curl --json '{"${w}":"Sh8oP"}' https://h.example.test`, ['Sh8oP'], ['--json ']],
+  ['curl -F key=value', `curl -F ${w}¤Sh8pP -F file=@a.png https://h.example.test`, ['Sh8pP'], ['-F file=@a.png']],
+  ['curl --form-string', `curl --form-string '${w}¤Sh8qP' https://h.example.test`, ['Sh8qP'], ['--form-string ']],
+  ['curl body after the url', `curl https://h.example.test --data ${w}¤Sh8rP -o /tmp/out`, ['Sh8rP'], ['-o /tmp/out']],
+  ['wget --post-data', `wget --post-data='user¤a&${w}¤Sh8sP' https://h.example.test`, ['Sh8sP'], ['user=a&']],
+];
+for (const [name, input, gone, kept] of MASKED4) {
+  check(`mask4: ${name}`, () => {
+    const { out } = run(input);
+    for (const g of gone) assert.ok(!out.includes(g), `secret "${g}" still present in: ${out}`);
+    for (const k of kept) assert.ok(out.includes(k), `expected "${k}" missing in: ${out}`);
+    assert.ok(out.includes('***['), `no mask marker in: ${out}`);
+    assert.strictEqual(run(out).out, out, 'second pass changed the output');
+  });
+}
+// Benign look-alikes stay byte-identical.
+const UNCHANGED4 = [
+  'zip -r out.zip dir',
+  'zip -r -9 out.zip dir src',
+  'unzip out.zip -d /tmp/x',
+  'unzip -l out.zip',
+  'scp -P 2222 a.zip host.example.test:/tmp/',
+  'scp a.zip -P 2222 host.example.test:/tmp/',
+  'rsync -P a b',
+  'redis-cli ping',
+  'redis-cli -h h.example.test -p 6379 ping',
+  'redis-cli -a $REDIS_AUTH ping',
+  'redis-cli --askpass ping',
+  '7z a archive.7z file',
+  '7z a -mx=9 archive.7z file',
+  '7z x archive.7z -o/tmp/out',
+  '7z a -p archive.7z file',
+  'curl -d name=bob https://h.example.test',
+  "curl --data 'a=1&b=2' https://h.example.test",
+  'curl --data-urlencode "q=hello world" https://h.example.test',
+  `curl -d '{"name":"bob"}' https://h.example.test`,
+  'curl -d @body.json https://h.example.test',
+  'curl -F file=@a.png https://h.example.test',
+  `curl -d "${w}=$PW_VAR" https://h.example.test`,
+  `curl -d '${w}=\${PW_VAR}&x=1' https://h.example.test`,
+  `curl -d 'by${w.slice(0, 4)}=1' https://h.example.test`,
+  `curl -d '${w}_hint=x' https://h.example.test`,
+  'curl --data-raw "" https://h.example.test',
+  `echo ${w}=nope`,
+  `echo '-d ${w}=notcurl'`,
+  'sshpass -P assword ssh -p 22 root@h.example.test',
+  'sshpass -f /tmp/pwfile ssh -p 22 root@h.example.test',
+  'mysql -P 3306 -h db.example.test app',
+  'curl -s $(echo a && echo b) https://h.example.test ; docker run -u 1000:1000 img',
+  'curl -s h.example.test) ; ps -u root:wheel',
+  'echo $(date && date) && ps -u root:wheel',
+];
+for (const input of UNCHANGED4) {
+  check(`unchanged4: ${JSON.stringify(input)}`, () => assert.strictEqual(run(input).out, input));
+}
+// Hostile long lines for the new rules (the hook has a 5 s timeout).
+const PERF2 = {
+  'sshpass -P repeated': 'sshpass' + ' -P x'.repeat(100000),
+  'sshpass -P quoted repeated': 'sshpass' + " -P 'a b'".repeat(60000),
+  'zip -P repeated': 'zip' + ' -P'.repeat(100000),
+  'zip clusters': 'zip' + ' -rP'.repeat(100000),
+  '7z -p repeated': '7z' + ' -p'.repeat(100000),
+  'redis-cli -a repeated': 'redis-cli' + ' -a'.repeat(100000),
+  'curl -d repeated': 'curl' + ' -d'.repeat(100000),
+  'curl -d key repeated': 'curl' + ` -d 'a&${w}=`.repeat(40000),
+  'curl -d json quotes': "curl -d '" + `"${w}":"`.repeat(30000),
+  'curl -d escaped json quotes': 'curl -d "' + `\\"${w}\\":\\"`.repeat(30000),
+  'curl -d key-like run': "curl -d '" + 'a_'.repeat(100000) + "'",
+  'unterminated double quote': 'curl -u "' + 'a\\"'.repeat(100000),
+  'backslash run': 'curl -u ' + '\\'.repeat(200000),
+  'quote then backslash': 'curl -u ' + '"\\'.repeat(100000),
+  'escaped space env': `PG${W}=` + '\\ '.repeat(100000),
+  'word pieces': 'curl -u ' + '"a"b\'c\''.repeat(30000),
+  'command substitution opens': 'curl ' + '$('.repeat(100000) + ' -u a:b',
+  'command substitution closes': 'curl ' + '))'.repeat(100000) + ' ; ls',
+  'parens and quotes': 'curl ' + '("\'(\\"'.repeat(40000),
+};
+for (const [name, line] of Object.entries(PERF2)) {
+  check(`perf2: ${name}`, () => {
+    const t0 = Date.now();
+    run(line);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 2000, `${ms} ms for ${line.length} chars`);
+  });
+}
+check('segmentEnd: a ; && || inside $( ) does not end the command', () => {
+  assert.strictEqual(segmentEnd('a $(b; c) d; e', 0), 11);
+  assert.strictEqual(segmentEnd('a $(b && c || d) e & f', 0), 19);
+  assert.strictEqual(segmentEnd('a $((1+2)) b; c', 0), 12);
+  assert.strictEqual(segmentEnd('a b) c; d', 0), 6);
+});
+
 // ---- library-level contract (not reachable through the CLI) ----
 check('redactText reports both layers as applied', () => {
   const r = redactText('echo hi');
