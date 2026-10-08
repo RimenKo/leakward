@@ -155,6 +155,83 @@ function isPlausibleSecretValue(rawValue) {
   return /\d/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
 }
 
+// Bare type words that appear after `name:` in annotated declarations
+// (pydantic `token: SecretStr`, TS `secret: string`, ...). Such a word is a
+// type, never a secret value.
+const TYPE_WORDS = /^(?:SecretStr|SecretBytes|SecretString|SecureString|Secret|Optional|Annotated|Union|Sequence|Any|str|string|String|bytes|Bytes|int|bool|float|number)$/;
+
+// True when `value` is a call (`os.getenv(`), a dotted/identifier reference
+// (`process.env.X;`, `settings.X`) or a bare type word, i.e. code that reads
+// or declares a secret rather than a secret literal. Used by the Azure and
+// JWT rules, whose value class admits `(`, `;` and dots. Unlike
+// isPlausibleSecretValue it does NOT require a digit or mixed case, because
+// those rules already demand 8+/32+ unquoted characters and a letters-only
+// run of that length is far more likely a real secret than an identifier;
+// only letters-with-underscore snake/SCREAMING names are treated as code.
+function isCodeReference(rawValue) {
+  if (/^["']/.test(rawValue)) return false;
+  if (/^[A-Za-z_$][\w$.]*\(/.test(rawValue)) return true;
+  const value = rawValue.replace(/[;,)\]}]+$/, '');
+  if (TYPE_WORDS.test(value)) return true;
+  // dotted chain with no digit (`process.env.X`, `settings.x.y`)
+  if (!/\d/.test(value) && /^[A-Za-z_$][A-Za-z_$]*(?:\.[A-Za-z_$][A-Za-z_$]*)+$/.test(value)) return true;
+  // letters-and-underscore snake/SCREAMING name (`jwt_signing_secret`)
+  if (/^[A-Za-z]+(?:_[A-Za-z]+)+$/.test(value)) return true;
+  return false;
+}
+
+function judgeAzureJwt(match) {
+  try {
+    const value = match.replace(/^[^=:]*[=:]\s*/, '');
+    return !isCodeReference(value);
+  } catch (_) { return true; }
+}
+
+// KNOWN_GAPS of the annotation-aware rules ('Generic secret in env', 'Generic
+// secret key (*_KEY)', 'Azure client secret', 'JWT secret'). Accepted on
+// purpose (validate-queue review 3ecd194e, 2026-10-08), NOT bugs to fix in code:
+//  - W1: an UNQUOTED value after an annotation (`token: str = Xk9mPq2LrT8vZw3`)
+//    is never flagged. In every typed language the rules target, an unquoted
+//    RHS after `name: T =` is an identifier/expression, not a string literal;
+//    judging it by digit+letter would re-block names like oauth2Token/TOKEN_V2.
+//  - W3: a digit-free alphabetic value glued straight to `[`
+//    (`AZURE_CLIENT_SECRET=Abcdefghijk[0]`) is skipped by the `(?![A-Za-z_.]+\[)`
+//    guard. Real Azure/JWT secrets carry digits or separators; contrived case.
+//  - W2 (quoted half): a quoted literal after an annotation IS flagged, same
+//    policy as the non-annotated path.
+//  - Not covered (false negatives): Go `:=` and `var x string = "..."`,
+//    Python prefixed strings (f"..", b".."), JS/TS template literals (backticks).
+//  - Informational: src/redact.js applies these regexes without validate(),
+//    so output redaction over-masks annotation text (harmless direction).
+//
+// Shared validate() for 'Generic secret in env' and 'Generic secret key
+// (*_KEY)'; `prefixRe` strips the name + separator (+ annotation).
+function judgeGenericAssignment(match, prefixRe) {
+  try {
+    const value = match.replace(prefixRe, '');
+    const prefix = match.slice(0, match.length - value.length);
+    // After a type annotation (`x: T = value`) an unquoted value is
+    // a variable name or expression (`const token: string = accessToken`),
+    // not a secret; only a quoted value is judged normally.
+    const annotated = /^[^:=]*:[^=]*=/.test(prefix);
+    // `name: SecretStr` / `name: SecretStr = Field(...)` / `name: SecretStr |
+    // None = None`: the annotation branch of the regex failed, so the TYPE
+    // NAME was taken as the value. A bare type word is never a secret.
+    if (!annotated && /:[ \t]*$/.test(prefix) && TYPE_WORDS.test(value)) return false;
+    // Glued `name: T=value` is ambiguous with the plain `name: Abc=Def`
+    // shape (value containing `=`). When T is a known type word it is an
+    // annotation: an unquoted value is an expression, a quoted one is judged
+    // as usual (quoted literals are always accepted).
+    const glued = prefix.match(/:[ \t]*([A-Za-z_.]+)=$/);
+    if (annotated && glued) {
+      if (TYPE_WORDS.test(glued[1])) return /^["']/.test(value);
+      return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ''));
+    }
+    if (annotated && !/^["']/.test(value)) return false;
+    return isPlausibleSecretValue(value);
+  } catch (_) { return true; }
+}
+
 // Regex patterns for secrets — ordered by category
 const SECRET_PATTERNS = [
   // ── AI providers ──────────────────────────────────────────────
@@ -175,7 +252,7 @@ const SECRET_PATTERNS = [
   { name: 'AWS Access Key ID',        regex: /(?:AKIA|ASIA)[0-9A-Z]{16}/g },
   { name: 'AWS Secret Access Key',    regex: /(?:aws[_\-]?secret[_\-]?(?:access[_\-]?)?key)\s*[=:]\s*["']?[A-Za-z0-9\/+=]{40}["']?/gi },
   { name: 'GCP service account',      regex: /"type"\s*:\s*"service_account"/g },
-  { name: 'Azure client secret',      regex: /(?:AZURE[_\-]?CLIENT[_\-]?SECRET)\s*[=:]\s*["']?(?![A-Za-z_.]+\[)[^\s"']{8,}["']?/gi },
+  { name: 'Azure client secret',      regex: /(?:AZURE[_\-]?CLIENT[_\-]?SECRET)\s*[=:]\s*["']?(?![A-Za-z_.]+\[)[^\s"']{8,}["']?/gi, validate: judgeAzureJwt },
   { name: 'DigitalOcean token',       regex: /dop_v1_[a-zA-Z0-9]{43}/g },
   { name: 'Cloudflare API token',     regex: /(?:CF[_\-]?(?:API[_\-]?)?TOKEN)\s*[=:]\s*["']?[A-Za-z0-9_\-]{40,}["']?/gi },
   { name: 'Cloudflare Global Key',    regex: /(?:CF[_\-]?(?:API[_\-]?)?KEY)\s*[=:]\s*["']?[a-f0-9]{37}["']?/gi },
@@ -291,7 +368,7 @@ const SECRET_PATTERNS = [
 
   // ── Keys & certificates ───────────────────────────────────────
   { name: 'Private key block',        regex: /-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g },
-  { name: 'JWT secret',               regex: /(?:JWT[_\-]?SECRET|TOKEN[_\-]?SECRET)\s*[=:]\s*["']?(?![A-Za-z_.]+\[)[^\s"']{32,}["']?/gi },
+  { name: 'JWT secret',               regex: /(?:JWT[_\-]?SECRET|TOKEN[_\-]?SECRET)\s*[=:]\s*["']?(?![A-Za-z_.]+\[)[^\s"']{32,}["']?/gi, validate: judgeAzureJwt },
 
   // ── Generic catch-all ─────────────────────────────────────────
   {
@@ -331,19 +408,7 @@ const SECRET_PATTERNS = [
     // separator before the `[`, so it still matches; only a digit-free,
     // separator-free identifier run directly followed by `[` is dropped.
     regex: /(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
-    validate: (match) => {
-      try {
-        const value = match.replace(/^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/i, '');
-        // After a type annotation (`x: T = value`) an unquoted value is
-        // a variable name or expression (`const token: string = accessToken`),
-        // not a secret; only a quoted value is judged normally.
-        const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
-        const prefix = match.slice(0, match.length - value.length);
-        if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
-        if (annotated && !/^["']/.test(value)) return false;
-        return isPlausibleSecretValue(value);
-      } catch (_) { return true; }
-    },
+    validate: (match) => judgeGenericAssignment(match, /^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/i),
   },
   {
     name: 'Generic secret key (*_KEY)',
@@ -377,19 +442,7 @@ const SECRET_PATTERNS = [
     // validate() uses the shared isPlausibleSecretValue() (this rule
     // previously had no validate() at all).
     regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
-    validate: (match) => {
-      try {
-        const value = match.replace(/^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/, '');
-        // After a type annotation (`x: T = value`) an unquoted value is
-        // a variable name or expression (`const token: string = accessToken`),
-        // not a secret; only a quoted value is judged normally.
-        const annotated = /^[^:=]*:[^=]*=/.test(match.slice(0, match.length - value.length));
-        const prefix = match.slice(0, match.length - value.length);
-        if (annotated && /:[ \t]*[A-Za-z_.]+=$/.test(prefix)) return isPlausibleSecretValue(match.replace(/^[^:]*:[ \t]*/, ""));
-        if (annotated && !/^["']/.test(value)) return false;
-        return isPlausibleSecretValue(value);
-      } catch (_) { return true; }
-    },
+    validate: (match) => judgeGenericAssignment(match, /^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/),
   },
 
   // ── Base64-obfuscated secrets ──────────────────────────────────

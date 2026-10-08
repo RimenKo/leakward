@@ -391,8 +391,8 @@ test('secret with a digit glued straight to "[" IS still caught', () => {
 // indistinguishable by shape alone from a genuine unquoted mixed-case secret
 // with no digit (the very next test below deliberately requires the latter to
 // stay flagged) — no regex-only signal separates the two without a dictionary.
-test('a bare mixed-case identifier with no digit is still (falsely) caught — accepted trade-off, see isPlausibleSecretValue', () => {
-  assert.strictEqual(detectsKey('API_KEY: Optional'), true); // gitleaks:allow — fake fixture, not a real key
+test('a bare mixed-case identifier with no digit that is NOT a known type word is still (falsely) caught — accepted trade-off, see isPlausibleSecretValue', () => {
+  assert.strictEqual(detectsKey('API_KEY: SomethingElse'), true); // gitleaks:allow — fake fixture, not a real key
 });
 
 test('an unquoted mixed-case value with no digit is still caught as a plausible secret (this is the real case the trade-off above protects)', () => {
@@ -744,6 +744,53 @@ test('a bare type glued to "=" is the old "name: value" shape, whole value is ju
   assert.strictEqual(detectsGeneric('pass' + 'word: Abc=DefGhiJk'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsGeneric('pass' + 'word: admin=12345678'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsGeneric('tok' + 'en: Optional[str]=None'), false);
+});
+
+// ── Round 7 (2026-10-08): validate-queue 3ecd194e findings E1, E2, W2-camelCase, W4 ──
+// Fixtures are built by concatenation so the live leakward hook does not block
+// writing this file; none of the values is a real secret.
+
+test('E1: pydantic SecretStr without brackets is NOT caught (Generic + *_KEY), a real value still IS', () => {
+  assert.strictEqual(detectsGeneric('tok' + 'en: SecretStr'), false);
+  assert.strictEqual(detectsGeneric('pass' + 'word: SecretStr = Field(default=None)'), false);
+  assert.strictEqual(detectsGeneric('JWT_SEC' + 'RET: SecretStr = Field(default=..., env="JWT_SEC' + 'RET")'), false);
+  assert.strictEqual(detectsKey('OPENAI_API' + '_KEY: SecretStr = Field(...)'), false);
+  assert.strictEqual(detectsKey('SIGNING' + '_KEY: SecretStr | None = None'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en: SecretStr = "Ab3dEf9hIj2kLm"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('SIGNING' + '_KEY: SecretStr = "Ab3dEf9hIj2kLm"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('pass' + 'word: CorrectHorseBattery'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('E2: Azure rule ignores env/settings reads and SecretStr, still catches real values', () => {
+  const az = 'AZURE_CLIENT' + '_SECRET';
+  assert.strictEqual(detectsWith(azurePattern, az + ' = os.getenv("' + az + '")'), false);
+  assert.strictEqual(detectsWith(azurePattern, az + ' = os.environ.get("' + az + '")'), false);
+  assert.strictEqual(detectsWith(azurePattern, 'const ' + az + ' = process.env.' + az + ';'), false);
+  assert.strictEqual(detectsWith(azurePattern, az.toLowerCase() + ' = settings.' + az.toLowerCase()), false);
+  assert.strictEqual(detectsWith(azurePattern, az + ': SecretStr = Field(...)'), false);
+  assert.strictEqual(detectsWith(azurePattern, az + '=Ab3~dEf9.hIj2-kLm_NoPq'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(azurePattern, az + ': "Ab3~dEf9.hIj2-kLm_NoPq"'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('E2: JWT rule ignores env/settings reads, still catches real values', () => {
+  const jw = 'JWT_SEC' + 'RET';
+  assert.strictEqual(detectsWith(jwtPattern, jw + ' = settings.authentication.jwt_signing_secret'), false);
+  assert.strictEqual(detectsWith(jwtPattern, 'const ' + jw + ' = process.env.JWT_KEY_FOR_SIGNING_TOKENS;'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + ' = os.getenv("JWT_KEY_FOR_SIGNING_TOKENS_X")'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + ' = jwt_signing_secret_from_the_vault_value'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefghijklmnopqrstuvwxyz012345678'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefghijklmnopqrstuvwxyzabcdefghij'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + ': "abcdefghijklmnopqrstuvwxyz_abcdefghij"'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('W2 camelCase / W4: glued "name: T=value" with a known type word is an annotation', () => {
+  assert.strictEqual(detectsGeneric('tok' + 'en: str=accessToken'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en: string=accessToken'), false);
+  assert.strictEqual(detectsKey('API' + '_KEY: str=accessToken'), false);
+  assert.strictEqual(detectsGeneric('pass' + 'word: str="correcthorsebattery"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('SIGNING' + '_KEY: str="correcthorsebattery"'), true); // gitleaks:allow — fake fixture, not a real key
+  // unknown left-hand word: still the plain "name: value=more" shape
+  assert.strictEqual(detectsGeneric('pass' + 'word: Abc=DefGhiJk'), true); // gitleaks:allow — fake fixture, not a real key
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
