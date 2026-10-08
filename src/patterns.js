@@ -195,7 +195,8 @@ function judgeAzureJwt(match) {
 //    RHS after `name: T =` is an identifier/expression, not a string literal;
 //    judging it by digit+letter would re-block names like oauth2Token/TOKEN_V2.
 //    Same for the glued form with no space, `NAME:str=<unquoted value>`, for
-//    any known type word (`TOKEN:str=hunter2hunter2` was flagged before
+//    any known type word, Generic rules only (Azure/JWT still flag it;
+//    `TOKEN:str=hunter2hunter2` was flagged before
 //    f0e4a18, is not now).
 //  - W3: a digit-free alphabetic value glued straight to `[`
 //    (`AZURE_CLIENT_SECRET=Abcdefghijk[0]`) is skipped by the `(?![A-Za-z_.]+\[)`
@@ -233,8 +234,10 @@ function judgeAzureJwt(match) {
 //  - JSON-style assignments (`"AZURE_CLIENT_SECRET": "value"`,
 //    `"JWT_SECRET": "value"`, `"TOKEN_SECRET": "value"`) are not flagged by the
 //    Azure and JWT rules: the closing quote of the key sits between the name
-//    and the separator. The unquoted-key form `AZURE_CLIENT_SECRET: "v"` IS
-//    still flagged. Same before the fix; left as is.
+//    and the separator. `"NAME"="v"` and single-quoted `'NAME': 'v'` are
+//    equally unflagged. The unquoted-key form `AZURE_CLIENT_SECRET: "v"` IS
+//    still flagged, and since f0e4a18 so is the glued quoted `NAME:str="v"`
+//    (newly flagged, safe direction). Same before the fix; left as is.
 //  - Informational: src/redact.js applies these regexes without validate(),
 //    so output redaction over-masks annotation text (harmless direction).
 //

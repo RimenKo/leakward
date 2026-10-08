@@ -804,6 +804,13 @@ test('documented gaps (KNOWN_GAPS): underscore passphrase, ident( prefix, type-w
   assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefgh$ijklmnopqrstuvwxyzabcdefgh'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsWith(jwtPattern, jw + '=correct__horse_battery_staple_xyz'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_xyz;'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=_correct_horse_battery_staple_pass'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_pass_'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_stap$le_pass'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_pass2'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct..horse_battery_staple_xyz'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=.correct.horse_battery_staple_xyz'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct.horse_battery_staple_xyz.'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsWith(jwtPattern, '"TOKEN_SEC' + 'RET": "abcdefghijklmnopqrstuvwxyz012345678"'), false);
   assert.strictEqual(detectsWith(azurePattern, '"AZURE_CLIENT' + '_SECRET": "Ab3~dEf9.hIj2-kLm_NoPq"'), false);
   assert.strictEqual(detectsWith(azurePattern, 'AZURE_CLIENT' + '_SECRET: "Ab3~dEf9.hIj2-kLm_NoPq"'), true); // gitleaks:allow — fake fixture, not a real key
