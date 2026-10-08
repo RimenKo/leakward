@@ -194,6 +194,9 @@ function judgeAzureJwt(match) {
 //    is never flagged. In every typed language the rules target, an unquoted
 //    RHS after `name: T =` is an identifier/expression, not a string literal;
 //    judging it by digit+letter would re-block names like oauth2Token/TOKEN_V2.
+//    Same for the glued form with no space, `NAME:str=<unquoted value>`, for
+//    any known type word (`TOKEN:str=hunter2hunter2` was flagged before
+//    f0e4a18, is not now).
 //  - W3: a digit-free alphabetic value glued straight to `[`
 //    (`AZURE_CLIENT_SECRET=Abcdefghijk[0]`) is skipped by the `(?![A-Za-z_.]+\[)`
 //    guard. Real Azure/JWT secrets carry digits or separators; contrived case.
@@ -201,25 +204,37 @@ function judgeAzureJwt(match) {
 //    policy as the non-annotated path.
 //  - Not covered (false negatives): Go `:=` and `var x string = "..."`,
 //    Python prefixed strings (f"..", b".."), JS/TS template literals (backticks).
-//  - Azure/JWT validate (isCodeReference) drops, by design: an unquoted value
-//    made only of letters, `_`, `$` and `.` in any combination with no digit
-//    (`correct_horse_battery_staple`, `correct_horse.battery_staple_pass`,
-//    `abcdefgh$ijklmnop.qrstuvwxyz`), so a passphrase-style JWT_SECRET written
-//    that way is a false negative. A letters-only run with no separator
-//    (any length >= the rule floor) and anything with a digit is still flagged.
-//    No length floor: a 32+ char snake_case name is
-//    as likely a variable name as a passphrase.
-//  - Azure/JWT validate also drops an unquoted value that STARTS with an
-//    identifier followed by `(` (`os.getenv(`); a real secret of the form
-//    `Ab3dEf(...` is a false negative.
+//  - Azure/JWT validate (isCodeReference) drops, by design, an unquoted value
+//    that (after a trailing run of `;,)]}` is stripped, so
+//    `correct_horse_battery_staple;` is dropped too) is one of:
+//      * a bare type word (SecretStr, string, ...);
+//      * a dotted chain: two or more segments of letters/`_`/`$` joined by
+//        single dots, no digit (`process.env.X`, `correct_horse.battery_staple`,
+//        `abcdefgh$ijklmnop.qrstuvwxyz`);
+//      * a snake/SCREAMING name: letter runs joined by SINGLE underscores, at
+//        least one underscore, no digit, no `$`, no dot
+//        (`correct_horse_battery_staple`).
+//    A passphrase-style JWT_SECRET written that way is a false negative. Still
+//    FLAGGED: `$` without a dot (`abcdefgh$ijklmnopqrstuvwxyzab`), leading,
+//    trailing or doubled underscores (`correct__horse_battery_staple_x`,
+//    `correct_horse_battery_staple_`), adjacent dots
+//    (`correct..horse_battery_staple_xyz`), letters-only runs with no
+//    separator, and anything containing a digit EXCEPT the `ident(` form in
+//    the next bullet. No length floor: a 32+ char snake_case name is as likely
+//    a variable name as a passphrase.
+//  - Azure/JWT validate also drops an unquoted value that STARTS with
+//    `[A-Za-z_$][\w$.]*(` (`os.getenv(`), digits allowed in the identifier;
+//    a real secret of the form `Ab3dEf(...` is a false negative (this is the
+//    one digit-bearing exception to the bullet above).
 //  - E1 type-word rule: `SecretStr("<quoted literal>")` is not flagged (the
 //    call form was never matched), and a real password that is literally a
 //    type word (`password: string`) is dropped. Inherent to treating a bare
 //    type word after `name:` as an annotation.
 //  - JSON-style assignments (`"AZURE_CLIENT_SECRET": "value"`,
-//    `"JWT_SECRET": "value"`) are not flagged by the Azure and JWT rules: the
-//    closing quote of the key sits between the name and the separator. Same
-//    before the fix; left as is.
+//    `"JWT_SECRET": "value"`, `"TOKEN_SECRET": "value"`) are not flagged by the
+//    Azure and JWT rules: the closing quote of the key sits between the name
+//    and the separator. The unquoted-key form `AZURE_CLIENT_SECRET: "v"` IS
+//    still flagged. Same before the fix; left as is.
 //  - Informational: src/redact.js applies these regexes without validate(),
 //    so output redaction over-masks annotation text (harmless direction).
 //

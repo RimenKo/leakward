@@ -801,6 +801,13 @@ test('documented gaps (KNOWN_GAPS): underscore passphrase, ident( prefix, type-w
   assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse.battery_staple_passphrase'), false);
   assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefgh$ijklmnop.qrstuvwxyzabcdefgh'), false);
   assert.strictEqual(detectsWith(jwtPattern, '"' + jw + '": "abcdefghijklmnopqrstuvwxyz012345678"'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefgh$ijklmnopqrstuvwxyzabcdefgh'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct__horse_battery_staple_xyz'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_xyz;'), false);
+  assert.strictEqual(detectsWith(jwtPattern, '"TOKEN_SEC' + 'RET": "abcdefghijklmnopqrstuvwxyz012345678"'), false);
+  assert.strictEqual(detectsWith(azurePattern, '"AZURE_CLIENT' + '_SECRET": "Ab3~dEf9.hIj2-kLm_NoPq"'), false);
+  assert.strictEqual(detectsWith(azurePattern, 'AZURE_CLIENT' + '_SECRET: "Ab3~dEf9.hIj2-kLm_NoPq"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('TOK' + 'EN:str=hunter2hunter2'), false);
   assert.strictEqual(detectsGeneric('pass' + 'word: string'), false);
 });
 
