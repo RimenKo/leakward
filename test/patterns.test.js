@@ -793,5 +793,13 @@ test('W2 camelCase / W4: glued "name: T=value" with a known type word is an anno
   assert.strictEqual(detectsGeneric('pass' + 'word: Abc=DefGhiJk'), true); // gitleaks:allow — fake fixture, not a real key
 });
 
+test('documented gaps (KNOWN_GAPS): underscore passphrase, ident( prefix, type-word password are dropped; letters-only run still flagged', () => {
+  const jw = 'JWT_SEC' + 'RET';
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_pass'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=Ab3dEf9hIj2kLm(NoPq4rStUv5wXyZ6a7b8c9'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefghijklmnopqrstuvwxyzabcdefghij'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('pass' + 'word: string'), false);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

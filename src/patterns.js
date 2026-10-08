@@ -201,6 +201,20 @@ function judgeAzureJwt(match) {
 //    policy as the non-annotated path.
 //  - Not covered (false negatives): Go `:=` and `var x string = "..."`,
 //    Python prefixed strings (f"..", b".."), JS/TS template literals (backticks).
+//  - Azure/JWT validate (isCodeReference) drops, by design: an unquoted value
+//    made only of letters and underscores (`correct_horse_battery_staple`) or
+//    only of letters and dots with no digit, so a passphrase-style
+//    JWT_SECRET written that way is a false negative. A letters-only run with
+//    no underscore/dot (any length >= the rule floor) and anything with a
+//    digit is still flagged. No length floor: a 32+ char snake_case name is
+//    as likely a variable name as a passphrase.
+//  - Azure/JWT validate also drops an unquoted value that STARTS with an
+//    identifier followed by `(` (`os.getenv(`); a real secret of the form
+//    `Ab3dEf(...` is a false negative.
+//  - E1 type-word rule: `SecretStr("<quoted literal>")` is not flagged (the
+//    call form was never matched), and a real password that is literally a
+//    type word (`password: string`) is dropped. Inherent to treating a bare
+//    type word after `name:` as an annotation.
 //  - Informational: src/redact.js applies these regexes without validate(),
 //    so output redaction over-masks annotation text (harmless direction).
 //
