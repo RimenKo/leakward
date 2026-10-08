@@ -798,6 +798,9 @@ test('documented gaps (KNOWN_GAPS): underscore passphrase, ident( prefix, type-w
   assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse_battery_staple_pass'), false);
   assert.strictEqual(detectsWith(jwtPattern, jw + '=Ab3dEf9hIj2kLm(NoPq4rStUv5wXyZ6a7b8c9'), false);
   assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefghijklmnopqrstuvwxyzabcdefghij'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=correct_horse.battery_staple_passphrase'), false);
+  assert.strictEqual(detectsWith(jwtPattern, jw + '=abcdefgh$ijklmnop.qrstuvwxyzabcdefgh'), false);
+  assert.strictEqual(detectsWith(jwtPattern, '"' + jw + '": "abcdefghijklmnopqrstuvwxyz012345678"'), false);
   assert.strictEqual(detectsGeneric('pass' + 'word: string'), false);
 });
 

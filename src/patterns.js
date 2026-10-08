@@ -202,11 +202,12 @@ function judgeAzureJwt(match) {
 //  - Not covered (false negatives): Go `:=` and `var x string = "..."`,
 //    Python prefixed strings (f"..", b".."), JS/TS template literals (backticks).
 //  - Azure/JWT validate (isCodeReference) drops, by design: an unquoted value
-//    made only of letters and underscores (`correct_horse_battery_staple`) or
-//    only of letters and dots with no digit, so a passphrase-style
-//    JWT_SECRET written that way is a false negative. A letters-only run with
-//    no underscore/dot (any length >= the rule floor) and anything with a
-//    digit is still flagged. No length floor: a 32+ char snake_case name is
+//    made only of letters, `_`, `$` and `.` in any combination with no digit
+//    (`correct_horse_battery_staple`, `correct_horse.battery_staple_pass`,
+//    `abcdefgh$ijklmnop.qrstuvwxyz`), so a passphrase-style JWT_SECRET written
+//    that way is a false negative. A letters-only run with no separator
+//    (any length >= the rule floor) and anything with a digit is still flagged.
+//    No length floor: a 32+ char snake_case name is
 //    as likely a variable name as a passphrase.
 //  - Azure/JWT validate also drops an unquoted value that STARTS with an
 //    identifier followed by `(` (`os.getenv(`); a real secret of the form
@@ -215,6 +216,10 @@ function judgeAzureJwt(match) {
 //    call form was never matched), and a real password that is literally a
 //    type word (`password: string`) is dropped. Inherent to treating a bare
 //    type word after `name:` as an annotation.
+//  - JSON-style assignments (`"AZURE_CLIENT_SECRET": "value"`,
+//    `"JWT_SECRET": "value"`) are not flagged by the Azure and JWT rules: the
+//    closing quote of the key sits between the name and the separator. Same
+//    before the fix; left as is.
 //  - Informational: src/redact.js applies these regexes without validate(),
 //    so output redaction over-masks annotation text (harmless direction).
 //
