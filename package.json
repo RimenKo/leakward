@@ -3,7 +3,21 @@
   "version": "0.1.15",
   "description": "Protect your projects from AI-tool secret leaks — catches .claude/, .cursor/, and hidden credentials before npm publish or git push",
   "keywords": [
-    "leakward", "security", "secrets", "claude-code", "cursor", "ai", "leak", "npm-publish", "api-key"
+    "leakward",
+    "security",
+    "secrets",
+    "secret-scanning",
+    "pre-commit",
+    "mcp",
+    "copilot",
+    "windsurf",
+    "gitleaks-alternative",
+    "claude-code",
+    "cursor",
+    "ai",
+    "leak",
+    "npm-publish",
+    "api-key"
   ],
   "author": "RimenKo",
   "license": "MIT",
@@ -30,6 +44,6 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=16"
+    "node": ">=18"
   }
 }

@@ -238,7 +238,7 @@ elif command -v aiguard &>/dev/null; then
     aiguard "${ARGS[@]}" 2>&1
     exit $?
 else
-    npx --yes @rimenko-dev/leakward "${ARGS[@]}" 2>&1
+    npx --yes @rimenko-dev/leakward@0.1 "${ARGS[@]}" 2>&1
     exit $?
 fi
 ```
@@ -321,6 +321,18 @@ Strings labeled as keys/tokens are decoded from Base64, then the decoded value i
 
 ---
 
+## Работает офлайн, без телеметрии
+
+`leakward` is a local scanner. It does not phone home:
+
+- No `http` / `https` / `net` / `fetch` / telemetry clients are loaded from `src/`, `bin/`, or `claude-hook/`
+- Scanning reads local files and (optionally) local git history only
+- No analytics, crash reports, or usage pings
+
+You can run it on an air-gapped machine after install. Network access is needed only to download the package itself (`npm install` / `npx`), not to scan.
+
+---
+
 ## Recommended `.npmignore`
 
 ```
@@ -347,7 +359,7 @@ npm install -g @rimenko-dev/leakward
 Or run without installing:
 
 ```bash
-npx @rimenko-dev/leakward
+npx @rimenko-dev/leakward@0.1
 ```
 
 The previous package name still installs the same scanner:
