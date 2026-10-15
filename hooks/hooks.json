@@ -1,0 +1,29 @@
+{
+  "description": "Block secret writes on PreToolUse and redact secrets from tool output on PostToolUse",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/claude-hook/leakward-hook.js\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/claude-hook/leakward-output-hook.js\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

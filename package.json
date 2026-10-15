@@ -41,6 +41,8 @@
     "bin/",
     "src/",
     "claude-hook/",
+    ".claude-plugin/",
+    "hooks/",
     "README.md"
   ],
   "engines": {

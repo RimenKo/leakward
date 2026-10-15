@@ -1,0 +1,21 @@
+{
+  "name": "leakward",
+  "displayName": "Leakward",
+  "version": "0.1.15",
+  "description": "Protect your projects from AI-tool secret leaks — catches .claude/, .cursor/, and hidden credentials before npm publish or git push",
+  "author": {
+    "name": "RimenKo",
+    "url": "https://github.com/RimenKo"
+  },
+  "homepage": "https://github.com/RimenKo/leakward",
+  "repository": "https://github.com/RimenKo/leakward",
+  "license": "MIT",
+  "keywords": [
+    "leakward",
+    "security",
+    "secrets",
+    "secret-scanning",
+    "claude-code",
+    "hooks"
+  ]
+}
