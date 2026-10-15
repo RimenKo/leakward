@@ -31,7 +31,18 @@ function git(dir, args) {
   execFileSync('git', args, {
     cwd: dir,
     stdio: 'pipe',
-    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+      // Author/committer via env so commits work when global/system gitconfig
+      // are forced off (no host identity) — local `git config user.*` is fine
+      // too, but env covers every commit path through this helper.
+      GIT_AUTHOR_NAME: 'Leakward Test',
+      GIT_AUTHOR_EMAIL: 'test@leakward.invalid',
+      GIT_COMMITTER_NAME: 'Leakward Test',
+      GIT_COMMITTER_EMAIL: 'test@leakward.invalid',
+    },
   });
 }
 
@@ -1637,6 +1648,171 @@ test('CLI: leakward.js --help and aiguard.js --help both print the leakward bann
     assert.ok(out.includes('leakward'), `${bin} --help must name leakward`);
     assert.ok(out.includes('aiguard'), `${bin} --help must still mention the aiguard alias`);
   }
+});
+
+// ── Diff hunk awareness: added lines starting with ++ must not be dropped ─
+// Content `++SECRET` becomes patch line `+++SECRET`; content `+++ b/foo`
+// becomes `++++ b/foo`. Old parser treated every `+++…` as a file header (or
+// dropped it via !startsWith('+++')), losing secrets on those lines.
+test('CLI: --staged finds a secret on an added line that starts with ++', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'note.js', 'module.exports = {};\n');
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+
+  writeFile(dir, 'note.js', `module.exports = {};\n++${FAKE_SECRET}\n`);
+  git(dir, ['add', 'note.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, '++SECRET added line must be scanned by --staged');
+  assert.ok(output.includes('AWS Access Key ID') || output.includes(FAKE_SECRET.slice(0, 4)), 'synthetic secret on ++ line must be reported');
+});
+
+test('CLI: --staged finds a secret when content includes a literal +++ b/foo line', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'note.js', 'module.exports = {};\n');
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+
+  // Literal content line "+++ b/foo" (patch form "++++ b/foo") plus a secret
+  // on the same added hunk — must not be mistaken for a +++ path header.
+  writeFile(dir, 'note.js', `module.exports = {};\n+++ b/foo\nconst key = "${FAKE_SECRET}";\n`);
+  git(dir, ['add', 'note.js']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, 'hunk with +++ b/foo content must still surface the secret via --staged');
+  assert.ok(output.includes('AWS Access Key ID') || output.includes('note.js'), 'secret after +++ b/foo content must be reported');
+});
+
+test('scanGitHistory: finds secrets on ++SECRET and +++ b/foo content lines', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'note.js', 'module.exports = {};\n');
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+
+  writeFile(
+    dir,
+    'note.js',
+    `module.exports = {};\n++${FAKE_SECRET}\n+++ b/foo\nconst other = "${FAKE_ANTHROPIC_SECRET}";\n`
+  );
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'plusplus content lines']);
+
+  const hits = scanGitHistory(dir).filter((f) => f.type === 'secret_pattern');
+  assert.ok(
+    hits.some((h) => (h.match && String(h.match).includes('AKIA')) || (h._raw && String(h._raw).includes('AKIA')) || (h.detail && String(h.detail).includes('AWS'))),
+    'history must find the AWS key on the ++SECRET line'
+  );
+  assert.ok(
+    hits.some((h) => (h.match && String(h.match).includes('sk-ant')) || (h._raw && String(h._raw).includes('sk-ant')) || (h.detail && /Anthropic/i.test(String(h.detail)))),
+    'history must find the secret that follows a literal +++ b/foo content line'
+  );
+});
+
+test('CLI: --history finds secrets on ++SECRET and +++ b/foo content lines', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'note.js', 'module.exports = {};\n');
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+
+  writeFile(
+    dir,
+    'note.js',
+    `module.exports = {};\n++${FAKE_SECRET}\n+++ b/foo\nconst other = "${FAKE_ANTHROPIC_SECRET}";\n`
+  );
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'plusplus content lines']);
+
+  // Clear the working tree secret so only history can report it.
+  writeFile(dir, 'note.js', 'module.exports = {};\n');
+  git(dir, ['add', 'note.js']);
+  git(dir, ['commit', '--quiet', '-m', 'remove secrets from tree']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--history'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  assert.strictEqual(status, 1, '--history must block when ++ / +++ content lines introduced secrets');
+  assert.ok(/AWS Access Key ID/i.test(output), '--history must report the ++SECRET AWS key');
+  assert.ok(/Anthropic/i.test(output), '--history must report the secret after +++ b/foo content');
+});
+
+// ── Text-like path with a leading NUL must not be silently skipped ───────
+test('scan(): .env with a leading NUL still finds a secret (or warns)', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'package.json', '{"name":"nul-env-fixture","version":"1.0.0"}\n');
+  const body = `AWS_ACCESS_KEY_ID=${FAKE_SECRET}\n`;
+  const buf = Buffer.concat([Buffer.from([0x00]), Buffer.from(body)]);
+  fs.writeFileSync(path.join(dir, '.env'), buf);
+  git(dir, ['add', 'package.json', '.env']);
+
+  const findings = scanIsolated(dir);
+  const envFindings = findings.filter((f) => f.file === '.env');
+  const hasSecret = envFindings.some((f) => f.type === 'secret_pattern');
+  const hasWarn = envFindings.some((f) => f.severity === 'WARN' || f.severity === 'HIGH' || f.severity === 'CRITICAL');
+  assert.ok(
+    hasSecret || hasWarn,
+    `.env with a leading NUL must yield a secret finding or a visible WARN; got: ${JSON.stringify(envFindings)}`
+  );
+});
+
+test('CLI: --staged finds a secret in .env that begins with a NUL byte', () => {
+  const dir = makeTempProject();
+  initGitRepo(dir);
+  writeFile(dir, 'package.json', '{"name":"nul-env-staged","version":"1.0.0"}\n');
+  git(dir, ['add', 'package.json']);
+  git(dir, ['commit', '--quiet', '-m', 'baseline']);
+
+  const body = `AWS_ACCESS_KEY_ID=${FAKE_SECRET}\n`;
+  const buf = Buffer.concat([Buffer.from([0x00]), Buffer.from(body)]);
+  fs.writeFileSync(path.join(dir, '.env'), buf);
+  git(dir, ['add', '.env']);
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  const cli = path.join(__dirname, '..', 'bin', 'aiguard.js');
+  let status = 0;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [cli, dir, '--staged'], { encoding: 'utf8', env });
+  } catch (err) {
+    status = err.status;
+    output = err.stdout || '';
+  }
+  const blocked = status === 1 && (/AWS Access Key ID/i.test(output) || /\.env/.test(output));
+  const warned = /WARN|бинар|NUL|null|не проверен/i.test(output) && /\.env/.test(output);
+  assert.ok(
+    blocked || warned,
+    `--staged on NUL-prefixed .env must find the secret or WARN; status=${status} output=${output.slice(0, 500)}`
+  );
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -986,9 +986,7 @@ function safeRead(filePath, knownSize) {
     const size = knownSize !== undefined ? knownSize : getFileSize(filePath);
     if (size === null || size > MAX_FILE_SIZE_BYTES) return null;
     const buf = fs.readFileSync(filePath);
-    const bom = detectUtf16Bom(buf);
-    if (!bom && isBinaryBuffer(buf)) return null;
-    return decodeText(buf, bom);
+    return decodeBufferForScan(buf, filePath);
   } catch (err) {
     // ENOENT here means the file vanished between the stat above (or the
     // caller's own stat) and this readFileSync — a normal race (file deleted
@@ -1123,14 +1121,24 @@ function readStagedDiffAddedLines(projectRoot, relPath, renameSources) {
   // Pure rename diffs have no '+' hunks → empty string. Rename+edit / ordinary
   // edits set +++ to the new path; when the old path is also in the pathspec,
   // ignore any additions that somehow attribute to a different +++ target.
+  //
+  // Hunk-aware: real `+++ b/file` headers only appear BEFORE a hunk (`@@`).
+  // Inside a hunk, an added content line that itself starts with `++` becomes
+  // `+++…` in the patch (e.g. content `++SECRET` → `+++SECRET`, content
+  // `+++ b/foo` → `++++ b/foo`). Treating every `+++` as a header (or dropping
+  // every line that starts with `+++`) silently lost those secrets.
   const added = [];
   let currentFile = '';
+  let inHunk = false;
   for (const line of diffOutput.split('\n')) {
     if (line.startsWith('diff --git ')) {
       currentFile = '';
-    } else if (line.startsWith('+++ ')) {
+      inHunk = false;
+    } else if (line.startsWith('@@')) {
+      inHunk = true;
+    } else if (!inHunk && line.startsWith('+++ ')) {
       currentFile = parseDiffNewPath(line);
-    } else if (line.startsWith('+') && !line.startsWith('+++')) {
+    } else if (inHunk && line.startsWith('+')) {
       if (renameFrom && currentFile && currentFile !== posix) continue;
       added.push(line.slice(1));
     }
@@ -1221,9 +1229,7 @@ function safeReadHeadText(projectRoot, relPath) {
       maxBuffer: MAX_FILE_SIZE_BYTES + 1024,
       timeout: GIT_COMMAND_TIMEOUT_MS,
     });
-    const bom = detectUtf16Bom(buf);
-    if (!bom && isBinaryBuffer(buf)) return null;
-    return decodeText(buf, bom);
+    return decodeBufferForScan(buf, relPath);
   } catch (_) {
     return UNREADABLE;
   }
@@ -1272,9 +1278,7 @@ function safeReadStaged(projectRoot, relPath) {
       maxBuffer: MAX_FILE_SIZE_BYTES + 1024,
       timeout: GIT_COMMAND_TIMEOUT_MS,
     });
-    const bom = detectUtf16Bom(buf);
-    if (!bom && isBinaryBuffer(buf)) return null;
-    return decodeText(buf, bom);
+    return decodeBufferForScan(buf, relPath);
   } catch (_) {
     return UNREADABLE;
   }
@@ -1315,6 +1319,33 @@ function detectUtf16Bom(buf) {
   return null;
 }
 
+// Extensions / basenames that are almost always text config or source.
+// A stray NUL (corrupt save, accidental binary prefix) used to make
+// isBinaryBuffer() skip these silently — e.g. `.env` with one leading 0x00
+// and a real secret after it. For these paths we still decode and scan
+// (embedded NULs become `\0` in the JS string; secret regexes still match).
+const TEXT_LIKE_EXTENSIONS = new Set([
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
+  '.json', '.jsonc', '.json5',
+  '.md', '.markdown', '.txt', '.rst',
+  '.yml', '.yaml', '.toml', '.ini', '.cfg', '.conf',
+  '.html', '.htm', '.css', '.scss', '.less',
+  '.sh', '.bash', '.zsh', '.ps1',
+  '.py', '.rb', '.go', '.rs', '.java', '.kt',
+  '.xml', '.svg', '.csv', '.env',
+]);
+
+function isTextLikePath(filePath) {
+  const base = path.basename(String(filePath)).toLowerCase();
+  if (base === '.env' || base.startsWith('.env.')) return true;
+  if (base === 'dockerfile' || base === 'makefile' || base === 'gemfile') return true;
+  if (base === '.gitignore' || base === '.npmignore' || base === '.leakwardignore' || base === '.aiguardignore') {
+    return true;
+  }
+  const ext = path.extname(base);
+  return Boolean(ext && TEXT_LIKE_EXTENSIONS.has(ext));
+}
+
 // `bom`, if passed, skips the internal detectUtf16Bom() call — safeRead()
 // already computed it once to pick a decoder, no need to redo it here too.
 function isBinaryBuffer(buf, bom) {
@@ -1323,6 +1354,18 @@ function isBinaryBuffer(buf, bom) {
     if (buf[i] === 0) return true;
   }
   return false;
+}
+
+// Decode when possible; for text-like paths keep scanning even if the
+// null-byte heuristic says "binary". Genuine binaries (.png/.gz/.dat) still
+// return null so callers skip them.
+function decodeBufferForScan(buf, filePath) {
+  const bom = detectUtf16Bom(buf);
+  if (!bom && isBinaryBuffer(buf, bom)) {
+    if (filePath && isTextLikePath(filePath)) return decodeText(buf, bom);
+    return null;
+  }
+  return decodeText(buf, bom);
 }
 
 // Decodes a UTF-16 buffer (BOM-stripped) to a normal JS string so the
@@ -1422,23 +1465,32 @@ function scanGitHistory(projectRoot) {
   // Parse into {sha, addedLines} blocks. Track the current diff path from
   // `+++ b/<file>` so .leakwardignore / .aiguardignore apply here too — "not scanned at all"
   // includes history, not just the working-tree pass.
+  //
+  // Same hunk-aware rule as readStagedDiffAddedLines: only treat `+++ ` as a
+  // file header outside a hunk. Inside a hunk, lines that start with `+++`
+  // are added content (content itself began with `++`), not path headers.
   const ignoreRules = loadIgnoreRules(projectRoot);
   const blocks = [];
   let current = null;
   let currentFile = '';
+  let inHunk = false;
   for (const line of logOutput.split('\n')) {
     if (line.startsWith('COMMIT:')) {
       current = { sha: line.slice(7, 15), files: new Map() };
       currentFile = '';
+      inHunk = false;
       blocks.push(current);
     } else if (current && line.startsWith('diff --git ')) {
       // A new file's `+++` may be quoted (`+++ "b/my seed.txt"`) and
       // would not update currentFile below — reset so those added lines
       // are not attributed to (and dropped with) the previous ignored file.
       currentFile = '';
-    } else if (current && line.startsWith('+++ ')) {
+      inHunk = false;
+    } else if (current && line.startsWith('@@')) {
+      inHunk = true;
+    } else if (current && !inHunk && line.startsWith('+++ ')) {
       currentFile = parseDiffNewPath(line);
-    } else if (current && line.startsWith('+') && !line.startsWith('+++')) {
+    } else if (current && inHunk && line.startsWith('+')) {
       if (currentFile && ignoreRules.length && isPathIgnored(currentFile, ignoreRules)) continue;
       if (!current.files.has(currentFile)) current.files.set(currentFile, []);
       current.files.get(currentFile).push(line.slice(1));
