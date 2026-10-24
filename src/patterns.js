@@ -80,6 +80,37 @@ const AI_CONTENT_SENSITIVE_FILES = [
   '.claude/CLAUDE.md',
 ];
 
+// Environment-variable interpolation: `$NAME`, `${NAME}`, `%NAME%`, and the
+// double-quoted `"$NAME"`, `"${NAME}"`, `"%NAME%"`, plus single-quoted
+// `'${NAME}'` (shell, docker-compose, .env, Windows batch, GitHub-style
+// templates). It names where the secret lives, it is never the secret
+// itself. `$NAME` and `%NAME%` (bare or double-quoted) only for the
+// UPPER_SNAKE env-var convention, so a password that merely starts with `$`
+// and has lowercase letters (`$ecr3tP4ss`, `"$ecr3tP4ss"`) is still judged.
+// Single-quoted `'$NAME'` is a shell literal and is still judged.
+// A CI template expression `${{ secrets.NAME }}` (GitHub Actions, Gitea,
+// Forgejo), bare or in either quotes, is a reference too.
+// `${NAME:-default}` is NOT matched: its default may be a real literal.
+// The single choke point for all four annotation-aware rules: every
+// validate() (judgeGenericAssignment, judgeAzureJwt via isCodeReference)
+// checks it on the extracted value before any other branch.
+const ENV_INTERPOLATION = /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%|"\$\{[A-Za-z_][A-Za-z0-9_]*\}"|'\$\{[A-Za-z_][A-Za-z0-9_]*\}'|"\$[A-Z_][A-Z0-9_]*"|"%[A-Z_][A-Z0-9_]*%"|(["']?)\$\{\{[ \t]*[A-Za-z_][\w.\-]*[ \t]*\}\}\1)$/;
+
+function isEnvInterpolation(rawValue) {
+  // Every trailing-run strip in this file anchors the run start with a
+  // lookbehind: an unanchored `/[set]+$/` retries from every position of a
+  // long run of set characters, O(n^2) on a 40 KB quoted value.
+  return ENV_INTERPOLATION.test(rawValue.replace(/(?<![;,])[;,]+$/, ''));
+}
+
+// A dotted read from a well-known configuration root (`settings.S3_API_KEY`,
+// `config.DB2_PASSWORD`, `process.env.OAUTH2_TOKEN`) is code even when a
+// segment carries a digit. Every segment must be an identifier (cannot start
+// with a digit), so a real dotted secret such as
+// `configuration.production.deploy.key.v2.9f8e7d6c5b4a` (root not listed, and
+// a segment starting with a digit) is still judged by shape.
+const CONFIG_READ = /^(?:process\.env|import\.meta\.env|os\.environ|settings|config|env)(?:\.[A-Za-z_$][\w$]*)+$/;
+
 // Shared by 'Generic secret in env' and 'Generic secret key (*_KEY)' below
 // (see SECRET_PATTERNS) — kept in one place so the two rules cannot drift
 // out of sync the way they already did once (the *_KEY rule shipped for a
@@ -104,6 +135,7 @@ const AI_CONTENT_SENSITIVE_FILES = [
 // dropped (`.` excludes newlines by default in JS regex; found live —
 // multi-line quoted values were failing this check as "not a string").
 function isPlausibleSecretValue(rawValue) {
+  if (isEnvInterpolation(rawValue)) return false;
   if (/^["'][\s\S]*["']$/.test(rawValue)) return true;
   if (/^-?\d+(?:\.\d+)?$/.test(rawValue)) return false;
   // Strip a trailing TypeScript non-null/optional-chaining tail (`!`/`?`)
@@ -111,7 +143,8 @@ function isPlausibleSecretValue(rawValue) {
   // dotted chain; the bare `!` shouldn't be enough to dodge that check
   // (found live: it broke the chain regex's `$` anchor and let the whole
   // value fall through to the digit-or-mixed-case fallback instead).
-  const value = rawValue.replace(/[!?]+$/, '').replace(/\?\./g, '.');
+  const value = rawValue.replace(/(?<![!?])[!?]+$/, '').replace(/\?\./g, '.');
+  if (CONFIG_READ.test(value)) return false;
   // A dotted identifier chain with no digit anywhere (`process.env.API_KEY`,
   // `settings.STRIPE_API_KEY`, `Path.home`) reads as code, not a secret.
   // Digit-excluded so a real password/token that happens to contain a
@@ -163,16 +196,29 @@ const TYPE_WORDS = /^(?:SecretStr|SecretBytes|SecretString|SecureString|Secret|O
 // True when `value` is a call (`os.getenv(`), a dotted/identifier reference
 // (`process.env.X;`, `settings.X`) or a bare type word, i.e. code that reads
 // or declares a secret rather than a secret literal. Used by the Azure and
-// JWT rules, whose value class admits `(`, `;` and dots. Unlike
+// JWT rules, whose value class admits `(`, `;`, `$`, `%` and dots. Unlike
 // isPlausibleSecretValue it does NOT require a digit or mixed case, because
 // those rules already demand 8+/32+ unquoted characters and a letters-only
 // run of that length is far more likely a real secret than an identifier;
-// only letters-with-underscore snake/SCREAMING names are treated as code.
+// only letters-with-underscore snake/SCREAMING names are treated as code,
+// plus the shared ENV_INTERPOLATION and CONFIG_READ forms (see KNOWN_GAPS).
 function isCodeReference(rawValue) {
+  if (isEnvInterpolation(rawValue)) return true;
+  // A CI expression cut at its inner space by the value class (`${{`).
+  // Anchored: only `${{` + optional spaces + a dotted name and nothing else,
+  // so a CI fallback literal (`${{ x || '<literal>' }}`) is still judged.
+  // (A spaced `${{ x }}` reaches here as bare `${{`, cut at the space; its
+  // content is not visible to the rule, see KNOWN_GAPS.)
+  if (/^["']?\$\{\{(?:[ \t]*[A-Za-z_][\w.\-]*)?$/.test(rawValue)) return true;
   if (/^["']/.test(rawValue)) return false;
-  if (/^[A-Za-z_$][\w$.]*\(/.test(rawValue)) return true;
-  const value = rawValue.replace(/[;,)\]}]+$/, '');
+  // a call: `os.getenv(`, Rust `env::var(`, C# `config.GetValue<string>(`
+  if (/^[A-Za-z_$][\w$.:]*(?:<[\w$.:<>,]*>)?\(/.test(rawValue)) return true;
+  // Same normalization as isPlausibleSecretValue: a trailing TS non-null /
+  // optional tail (`!`, `?`) and optional chaining (`?.`) do not make a
+  // reference a secret (`process.env.AZURE_CLIENT_SECRET!;`).
+  const value = rawValue.replace(/(?<![;,)\]}!?])[;,)\]}!?]+$/, '').replace(/\?\./g, '.');
   if (TYPE_WORDS.test(value)) return true;
+  if (CONFIG_READ.test(value)) return true;
   // dotted chain with no digit (`process.env.X`, `settings.x.y`)
   if (!/\d/.test(value) && /^[A-Za-z_$][A-Za-z_$]*(?:\.[A-Za-z_$][A-Za-z_$]*)+$/.test(value)) return true;
   // letters-and-underscore snake/SCREAMING name (`jwt_signing_secret`)
@@ -182,7 +228,13 @@ function isCodeReference(rawValue) {
 
 function judgeAzureJwt(match) {
   try {
-    const value = match.replace(/^[^=:]*[=:]\s*/, '');
+    let value = match.replace(/^[^=:]*[=:]\s*/, '');
+    // Glued annotation `NAME:str=<value>`: the type word and `=` are not part
+    // of the value; judge what follows (so the env-reference choke point in
+    // isCodeReference sees the real value; an unquoted literal is still
+    // flagged, see W1 in KNOWN_GAPS).
+    const glued = value.match(/^([A-Za-z_.]+)=([\s\S]*)$/);
+    if (glued && TYPE_WORDS.test(glued[1])) value = glued[2];
     return !isCodeReference(value);
   } catch (_) { return true; }
 }
@@ -200,14 +252,27 @@ function judgeAzureJwt(match) {
 //    f0e4a18, is not now).
 //  - W3: a digit-free alphabetic value glued straight to `[`
 //    (`AZURE_CLIENT_SECRET=Abcdefghijk[0]`) is skipped by the `(?![A-Za-z_.]+\[)`
-//    guard. Real Azure/JWT secrets carry digits or separators; contrived case.
+//    guard (Generic rules: `(?![A-Za-z_.]+[\[<])`, also `<`). Real Azure/JWT
+//    secrets carry digits or separators; contrived case.
 //  - W2 (quoted half): a quoted literal after an annotation IS flagged, same
 //    policy as the non-annotated path.
 //  - Not covered (false negatives): Go `:=` and `var x string = "..."`,
-//    Python prefixed strings (f"..", b".."), JS/TS template literals (backticks).
+//    Python prefixed strings (f"..", b"..").
+//  - JS/TS template literals (backticks) are NOT a quote to these rules: the
+//    backtick is an ordinary character of the unquoted value. A backtick
+//    literal with no space inside and not after an annotation is judged like
+//    any unquoted value (a digit-bearing one IS flagged, see the test); one
+//    with a space inside, or after an annotation, is not.
+//  - A bare mixed-case type name that is not in TYPE_WORDS, written right
+//    after the colon of a token/password/*_KEY name (a UserToken type with a
+//    null default; the SomethingElse test), is still flagged by the Generic
+//    rules: see the KNOWN LIMITATION in isPlausibleSecretValue. Known type
+//    words with a nullable mark (SecretString?) and any type followed by
+//    `<...>` generic arguments (Observable<string>) are not.
 //  - Azure/JWT validate (isCodeReference) drops, by design, an unquoted value
-//    that (after a trailing run of `;,)]}` is stripped, so
-//    `correct_horse_battery_staple;` is dropped too) is one of:
+//    that (after a trailing run of `;,)]}!?` is stripped and `?.` is read as
+//    `.`, so `correct_horse_battery_staple;` and `process.env.X!;` are dropped
+//    too) is one of:
 //      * a bare type word (SecretStr, string, ...);
 //      * a dotted chain: two or more segments of letters/`_`/`$` joined by
 //        single dots, no digit (`process.env.X`, `correct_horse.battery_staple`,
@@ -220,24 +285,57 @@ function judgeAzureJwt(match) {
 //    trailing or doubled underscores (`correct__horse_battery_staple_x`,
 //    `correct_horse_battery_staple_`), adjacent dots
 //    (`correct..horse_battery_staple_xyz`), letters-only runs with no
-//    separator, and anything containing a digit EXCEPT the `ident(` form in
-//    the next bullet. No length floor: a 32+ char snake_case name is as likely
+//    separator, and anything containing a digit EXCEPT the three forms in the
+//    next bullets. No length floor: a 32+ char snake_case name is as likely
 //    a variable name as a passphrase.
 //  - Azure/JWT validate also drops an unquoted value that STARTS with
-//    `[A-Za-z_$][\w$.]*(` (`os.getenv(`), digits allowed in the identifier;
-//    a real secret of the form `Ab3dEf(...` is a false negative (this is the
-//    one digit-bearing exception to the bullet above).
+//    `[A-Za-z_$][\w$.:]*(<...>)?(` (`os.getenv(`, Rust `env::var(`, C#
+//    `GetValue<string>(`), digits allowed in the identifier; a real secret of
+//    the form `Ab3dEf(...` is a false negative (digit-bearing exception 1).
+//  - All four rules drop a dotted read from a configuration root
+//    (CONFIG_READ: `process.env.`, `import.meta.env.`, `os.environ.`,
+//    `settings.`, `config.`, `env.`) whose segments are identifiers, digits
+//    allowed (`settings.S3_API_KEY`, `process.env.OAUTH2_TOKEN`): a real
+//    secret that happens to look like `config.Ab3dEf9` is a false negative
+//    (digit-bearing exception 2).
+//  - All four rules drop an environment-variable interpolation
+//    (ENV_INTERPOLATION: `$NAME` / `%NAME%` with an UPPER_SNAKE name, bare or
+//    double-quoted, `${Name}`, quoted `"${Name}"` / `'${Name}'`, and CI
+//    `${{ secrets.NAME }}`), digits allowed in the name (digit-bearing
+//    exception 3). A real secret that is literally an UPPER_SNAKE `$NAME` /
+//    `%NAME%` (bare or in double quotes) is a false negative.
+//    `${NAME:-default}` and single-quoted `'$NAME'` are still judged.
+//    Azure/JWT see a spaced CI expression only up to its first space (their
+//    value class stops at whitespace), so `${{ secrets.X || '<literal>' }}`
+//    is dropped there (false negative); the unspaced form with a fallback is
+//    judged. A literal glued after a quoted reference (`"$NAME"<literal>`)
+//    is outside the match and not judged either.
 //  - E1 type-word rule: `SecretStr("<quoted literal>")` is not flagged (the
 //    call form was never matched), and a real password that is literally a
 //    type word (`password: string`) is dropped. Inherent to treating a bare
 //    type word after `name:` as an annotation.
-//  - JSON-style assignments (`"AZURE_CLIENT_SECRET": "value"`,
-//    `"JWT_SECRET": "value"`, `"TOKEN_SECRET": "value"`) are not flagged by the
-//    Azure and JWT rules: the closing quote of the key sits between the name
-//    and the separator. `"NAME"="v"` and single-quoted `'NAME': 'v'` are
-//    equally unflagged. The unquoted-key form `AZURE_CLIENT_SECRET: "v"` IS
-//    still flagged, and since f0e4a18 so is the glued quoted `NAME:str="v"`
-//    (newly flagged, safe direction). Same before the fix; left as is.
+//  - A literal passed as an argument of a call is not flagged by any of the
+//    four rules: the default of an environment lookup
+//    (`SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-...")`,
+//    `password = os.getenv("DB", "<default literal>")`) and `SecretStr("...")` alike. The
+//    unquoted value stops at `(` by design (calls are code); catching the
+//    default would need a separate call-aware rule. Accepted gap.
+//  - JSON-style / quoted-key assignments are not flagged by ANY of the four
+//    rules: `"AZURE_CLIENT_SECRET": "value"`, `"JWT_SECRET": "value"`,
+//    `"TOKEN_SECRET": "value"`, `{"password": "value"}`,
+//    `{"STRIPE_SECRET_KEY": "value"}`, `"NAME"="v"`, single-quoted
+//    `'NAME': 'v'`, and PHP/Ruby `'password' => 'v'` / `password => "v"`: the
+//    closing quote of the key (or `=>`) sits between the name and the
+//    separator. Accepted gap: matching quoted keys in the Generic rules would
+//    flag every i18n/locale label (`"password": "Passwort"`,
+//    `"token": "Token expired"`); vendor-prefixed values in such files are
+//    still caught by the vendor rules. The unquoted-key form
+//    `AZURE_CLIENT_SECRET: "v"` IS flagged. The glued quoted `NAME:str="v"`
+//    is NOT flagged by Azure/JWT (their value stops at the quote); the
+//    Generic rules flag it, as they did before f0e4a18.
+//  - Unquoted Generic values longer than 512 characters are judged on their
+//    first 512 characters (the regex accepts a full 512-character run without
+//    the end check), not skipped.
 //  - Informational: src/redact.js applies these regexes without validate(),
 //    so output redaction over-masks annotation text (harmless direction).
 //
@@ -246,6 +344,9 @@ function judgeAzureJwt(match) {
 function judgeGenericAssignment(match, prefixRe) {
   try {
     const value = match.replace(prefixRe, '');
+    // Choke point: an env-variable reference is never a secret, whatever
+    // annotation / glued / quoted branch below would otherwise decide.
+    if (isEnvInterpolation(value)) return false;
     const prefix = match.slice(0, match.length - value.length);
     // After a type annotation (`x: T = value`) an unquoted value is
     // a variable name or expression (`const token: string = accessToken`),
@@ -254,7 +355,9 @@ function judgeGenericAssignment(match, prefixRe) {
     // `name: SecretStr` / `name: SecretStr = Field(...)` / `name: SecretStr |
     // None = None`: the annotation branch of the regex failed, so the TYPE
     // NAME was taken as the value. A bare type word is never a secret.
-    if (!annotated && /:[ \t]*$/.test(prefix) && TYPE_WORDS.test(value)) return false;
+    // A trailing nullable/non-null mark (Kotlin/Swift/C# `SecretString?`)
+    // does not make the type word a value.
+    if (!annotated && /:[ \t]*$/.test(prefix) && TYPE_WORDS.test(value.replace(/(?<![?!])[?!]+$/, ''))) return false;
     // Glued `name: T=value` is ambiguous with the plain `name: Abc=Def`
     // shape (value containing `=`). When T is a known type word it is an
     // annotation: an unquoted value is an expression, a quoted one is judged
@@ -268,6 +371,31 @@ function judgeGenericAssignment(match, prefixRe) {
     return isPlausibleSecretValue(value);
   } catch (_) { return true; }
 }
+
+// Pieces of the two Generic rules, kept in ONE place: each rule's regex and
+// the `prefixRe` its validate() strips are both built from these strings, so
+// the four copies that used to be pasted by hand cannot drift apart.
+//  - a type atom is a dotted name with optional `[...]` subscripts / generic
+//    arguments (Python, nesting 2 levels, bounded so it cannot backtrack
+//    quadratically) or `<...>` generic arguments (TS, Kotlin, Java, C#,
+//    same bounds), then an optional `?` (nullable `String?`);
+//  - an annotation is `: T (| T){0,8} =` (PEP 604 / TS unions);
+//  - the unquoted value has the leading `(?![A-Za-z_.]+[\[<])` guard (a
+//    digit-free identifier glued to `[` or `<` is a type or a subscript) and
+//    the maximal-munch pair explained at 'Generic secret in env' below; a run
+//    of exactly 512 allowed characters is accepted without the end check, so
+//    a longer unquoted value (a long token in a .env file) is judged on its
+//    first 512 characters instead of silently skipped.
+const GENERIC_BRACKETS = String.raw`\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\]`;
+const GENERIC_ANGLES = String.raw`<(?:[^<>\n]|<[^<>\n]{0,64}>){0,64}>`;
+const GENERIC_TYPE_ATOM = String.raw`[A-Za-z_.]+(?:${GENERIC_BRACKETS}|${GENERIC_ANGLES})*\??`;
+const GENERIC_SEPARATOR = String.raw`(?:[ \t]*:[ \t]*${GENERIC_TYPE_ATOM}(?:[ \t]*\|[ \t]*${GENERIC_TYPE_ATOM}){0,8}[ \t]*=|[ \t]*[=:])[ \t]*`;
+const GENERIC_UNQUOTED = String.raw`[^\s"'(),;{}\[\]<>]`;
+const GENERIC_VALUE = String.raw`(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+[\[<])(?:${GENERIC_UNQUOTED}{8,511}(?!${GENERIC_UNQUOTED})|${GENERIC_UNQUOTED}{512})(?!\())`;
+const GENERIC_ENV_NAME = '(?:PASSWORD|SECRET|TOKEN)';
+const GENERIC_KEY_NAME = '[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?';
+const GENERIC_ENV_PREFIX_RE = new RegExp('^' + GENERIC_ENV_NAME + GENERIC_SEPARATOR, 'i');
+const GENERIC_KEY_PREFIX_RE = new RegExp('^' + GENERIC_KEY_NAME + GENERIC_SEPARATOR);
 
 // Regex patterns for secrets — ordered by category
 const SECRET_PATTERNS = [
@@ -444,8 +572,11 @@ const SECRET_PATTERNS = [
     // independent reviewer the same day. A real secret carries a digit, or a
     // separator before the `[`, so it still matches; only a digit-free,
     // separator-free identifier run directly followed by `[` is dropped.
-    regex: /(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/gi,
-    validate: (match) => judgeGenericAssignment(match, /^(?:PASSWORD|SECRET|TOKEN)(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/i),
+    // Since 2026-10-22 the guard is `(?![A-Za-z_.]+[\[<])`: the same holds
+    // for `<` (TS/Kotlin/Java generic arguments, `Observable<string>`).
+    // Built from the shared GENERIC_* pieces above.
+    regex: new RegExp(GENERIC_ENV_NAME + GENERIC_SEPARATOR + GENERIC_VALUE, 'gi'),
+    validate: (match) => judgeGenericAssignment(match, GENERIC_ENV_PREFIX_RE),
   },
   {
     name: 'Generic secret key (*_KEY)',
@@ -478,8 +609,9 @@ const SECRET_PATTERNS = [
     // environment-variable reads, zero real secrets among them).
     // validate() uses the shared isPlausibleSecretValue() (this rule
     // previously had no validate() at all).
-    regex: /[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*(?:"[^"]{8,}"|'[^']{8,}'|(?![A-Za-z_.]+\[)[^\s"'(),;{}\[\]<>]{8,512}(?![^\s"'(),;{}\[\]<>])(?!\())/g,
-    validate: (match) => judgeGenericAssignment(match, /^[A-Z][A-Z0-9]{0,63}_KEY(?:_ID|_VERSION)?(?:[ \t]*:[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*(?:[ \t]*\|[ \t]*[A-Za-z_.]+(?:\[(?:[^\[\]\n]|\[[^\[\]\n]{0,64}\]){0,64}\])*){0,8}[ \t]*=|[ \t]*[=:])[ \t]*/),
+    // Built from the shared GENERIC_* pieces above (case-sensitive, no 'i').
+    regex: new RegExp(GENERIC_KEY_NAME + GENERIC_SEPARATOR + GENERIC_VALUE, 'g'),
+    validate: (match) => judgeGenericAssignment(match, GENERIC_KEY_PREFIX_RE),
   },
 
   // ── Base64-obfuscated secrets ──────────────────────────────────

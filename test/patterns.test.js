@@ -315,11 +315,12 @@ test('a short (<16 char) all-uppercase, no-digit value is NOT caught — below t
 // attempt) reopened exactly the disease this file exists to cure: 460 live
 // false positives on a real multi-project corpus, because a bare lowercase
 // code identifier (`password`, `access_token`, `client_secret`) has neither
-// a digit nor mixed case either. The fallback is restored; a single bare
-// identifier with no digit is rejected explicitly (regardless of case) so
-// mixed-case ones (`Optional`, `getEnvOrDefault`) are still caught by this
-// net even when the digit-or-mixed-case fallback would have let them
-// through.
+// a digit nor mixed case either. The fallback is restored. Rejecting every
+// bare digit-free identifier regardless of case was tried and reverted the
+// same day: it also dropped real unquoted mixed-case secrets. A bare
+// mixed-case identifier with no digit is therefore still flagged (accepted
+// trade-off, see the KNOWN LIMITATION test further down and the comment in
+// isPlausibleSecretValue); lowercase ones are rejected by the fallback.
 
 test('bare lowercase identifier reused as its own "secret" is NOT caught (the exact live false-positive corpus: password = password)', () => {
   assert.strictEqual(detectsGeneric('TOKEN' + '=access_token'), false);
@@ -816,6 +817,147 @@ test('documented gaps (KNOWN_GAPS): underscore passphrase, ident( prefix, type-w
   assert.strictEqual(detectsWith(azurePattern, 'AZURE_CLIENT' + '_SECRET: "Ab3~dEf9.hIj2-kLm_NoPq"'), true); // gitleaks:allow — fake fixture, not a real key
   assert.strictEqual(detectsGeneric('TOK' + 'EN:str=hunter2hunter2'), false);
   assert.strictEqual(detectsGeneric('pass' + 'word: string'), false);
+});
+
+// ── Round 8 (2026-10-22): validate batch 3ecd194e, ТЗ items A, B, C, D3, E ──
+// Fixtures are concatenated so the live leakward hook does not block writing
+// this file; none of the values is a real secret.
+const AZ_NAME = 'AZURE_CLIENT' + '_SECRET';
+const JWT_NAME = 'JWT_SEC' + 'RET';
+const FAKE_VALUE = 'Xk9mPq2L' + 'rT8vZw3';
+
+test('A: Azure/JWT ignore env interpolation ($X, ${X}, %X%, "${X}")', () => {
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=$' + AZ_NAME), false);
+  assert.strictEqual(detectsWith(azurePattern, '- ' + AZ_NAME + '=${' + AZ_NAME + '}'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ': $' + AZ_NAME), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ' = %' + AZ_NAME + '%'), false);
+  assert.strictEqual(detectsWith(jwtPattern, JWT_NAME + '="${JWT_SIGNING_SECRET_FROM_ENVIRONMENT}"'), false);
+  assert.strictEqual(detectsGeneric(JWT_NAME + '="${JWT_SIGNING_SECRET_FROM_ENVIRONMENT}"'), false);
+  // still judged: lowercase after "$", a quoted "$..." literal, a ${X:-default}
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=$ecr3tP4' + 'ssw0rdXyz'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('PASS' + 'WORD="$ecr3tP4' + 'ss"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=${' + AZ_NAME + ':-' + FAKE_VALUE + '}'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('A: Azure/JWT ignore "!" / "?." tails and ::/<T> calls', () => {
+  assert.strictEqual(detectsWith(azurePattern, 'const ' + AZ_NAME + ' = process.env.' + AZ_NAME + '!;'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ' = process.env?.' + AZ_NAME), false);
+  assert.strictEqual(detectsWith(jwtPattern, 'const ' + JWT_NAME + ' = process.env.JWT_SIGNING_SECRET_FOR_TOKENS!;'), false);
+  assert.strictEqual(detectsWith(jwtPattern, 'const ' + JWT_NAME + ' = process.env?.JWT_SIGNING_SECRET_FOR_TOKENS;'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ' = env::var("' + AZ_NAME + '")'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ' = configuration.GetValue<string>("x")'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=Ab3~dEf9.hIj2-k' + 'Lm_NoPq'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('B: dotted reads from config roots are code even with a digit in a segment', () => {
+  assert.strictEqual(detectsKey('API_' + 'KEY = settings.S3_API_' + 'KEY'), false);
+  assert.strictEqual(detectsGeneric('pass' + 'word = config.DB2_PASS' + 'WORD'), false);
+  assert.strictEqual(detectsGeneric('const tok' + 'en = process.env.OAUTH2_TO' + 'KEN;'), false);
+  assert.strictEqual(detectsKey('AWS_SECRET_ACCESS_' + 'KEY = settings.S3_SECRET_ACCESS_' + 'KEY'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ' = settings.AZURE2_SEC' + 'RET'), false);
+  // unlisted root / digit-led segment: still judged
+  assert.strictEqual(detectsGeneric('SEC' + 'RET=configuration.production.deploy.key.v2.9f8e7d6c5b4a'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('PASS' + 'WORD=Passw0rd.Sec' + 'ure'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('C: TS/Kotlin annotations with <...> and a nullable "?" are not secrets, a quoted value after them is', () => {
+  assert.strictEqual(detectsGeneric('val tok' + 'en: SecretString? = null'), false);
+  assert.strictEqual(detectsGeneric('private tok' + 'en: Observable<string> = of("")'), false);
+  assert.strictEqual(detectsGeneric('sec' + 'ret: Nullable<string> = null'), false);
+  assert.strictEqual(detectsKey('SIGNING' + '_KEY: Map<String, List<String>>? = null'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en: Promise<string> = "' + FAKE_VALUE + '"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('tok' + 'en: List<String>? = "' + FAKE_VALUE + '"'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('C: annotation with many "<" stays linear (ReDoS guard)', () => {
+  const start = Date.now();
+  detectsGeneric('TO' + 'KEN: A' + '<b'.repeat(150000));
+  detectsGeneric(('TO' + 'KEN: A<b> | ').repeat(20000));
+  detectsKey('MY' + '_KEY: A' + '<<b>'.repeat(75000));
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs < 1000, `expected near-linear scan time (<1000ms), took ${elapsedMs}ms`);
+});
+
+test('D3: an unquoted value longer than 512 characters is judged, not skipped', () => {
+  assert.strictEqual(detectsGeneric('ACCESS_TO' + 'KEN=' + 'a1B2c3D4'.repeat(80)), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('MY_API' + '_KEY=' + 'a1B2c3D4'.repeat(80)), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('A_' + 'KEY=' + 'x'.repeat(120000) + '('), false);
+});
+
+test('E: KNOWN_GAPS claims pinned (template literal, glued quoted annotation, W3, Go, f"", SecretStr("..."), call defaults, quoted keys)', () => {
+  assert.strictEqual(detectsGeneric('const tok' + 'en = `' + FAKE_VALUE + '`;'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('const tok' + 'en = `my ' + FAKE_VALUE + '`;'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ':str="Ab3dEf9h' + 'Ij2kLm"'), false);
+  assert.strictEqual(detectsGeneric(AZ_NAME + ':str="Ab3dEf9h' + 'Ij2kLm"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=Abcdefghijk[0]'), false);
+  assert.strictEqual(detectsGeneric('tok' + 'en := "' + FAKE_VALUE + '"'), false);
+  assert.strictEqual(detectsGeneric('pass' + 'word = f"' + FAKE_VALUE + '"'), false);
+  assert.strictEqual(detectsGeneric('pass' + 'word = b"' + FAKE_VALUE + '"'), false);
+  assert.strictEqual(detectsGeneric('SecretStr("' + FAKE_VALUE + '")'), false);
+  assert.strictEqual(detectsKey('SECRET' + '_KEY = os.environ.get("SECRET' + '_KEY", "django-insecure-a8f9x2kq")'), false);
+  assert.strictEqual(detectsGeneric('{"pass' + 'word": "' + FAKE_VALUE + '"}'), false);
+  assert.strictEqual(detectsKey('{"STRIPE_SECRET' + '_KEY": "abc123def456ghi789"}'), false); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric("'pass" + "word' => '" + FAKE_VALUE + "'"), false);
+});
+
+// ── Round 8, ТЗ v2 (A', H, I): one env-reference corpus over all four rules ──
+// The env-reference check is a single choke point in every validate(); this
+// corpus runs each reference through every separator / annotation form of
+// each rule, so a branch that skips the check shows up here.
+test("A'/H: env-reference corpus is never a secret in any of the four rules, any separator or annotation form", () => {
+  const rules = [
+    ['Generic', genericSecretPattern, 'DB_PASS' + 'WORD'],
+    ['*_KEY', genericKeyPattern, 'STRIPE_API' + '_KEY'],
+    ['Azure', azurePattern, AZ_NAME],
+    ['JWT', jwtPattern, JWT_NAME],
+  ];
+  const refs = (n) => [
+    '$' + n, '${' + n + '}', '%' + n + '%',
+    '"$' + n + '"', '"${' + n + '}"', '"%' + n + '%"', "'${" + n + "}'",
+    '${{ secrets.' + n + ' }}', '"${{ secrets.' + n + ' }}"', "'${{ secrets." + n + " }}'",
+  ];
+  const seps = ['=', ' = ', ': ', ':', ': str = ', ': str=', ': string=', ': Optional[str] = ', ': SecretStr | None = '];
+  for (const [label, pattern, name] of rules) {
+    for (const ref of refs('SIGNING_SECRET_FOR_THE_SERVICE_V2')) {
+      for (const sep of seps) {
+        const line = name + sep + ref;
+        assert.strictEqual(detectsWith(pattern, line), false, `${label}: ${JSON.stringify(sep)} + ref #${refs('SIGNING_SECRET_FOR_THE_SERVICE_V2').indexOf(ref)}`);
+      }
+    }
+  }
+  // still judged: lowercase after "$", single-quoted '$NAME', a default value
+  assert.strictEqual(detectsGeneric('PASS' + 'WORD="$ecr3tP4' + 'ss"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('tok' + 'en: str="$ecr3tP4' + 'ss"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric("PASS" + "WORD='$DB_PASS" + "WORD2'"), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsKey('API' + '_KEY="${API' + '_KEY:-' + FAKE_VALUE + '}"'), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsGeneric('pass' + 'word: str="correcthorsebattery"'), true); // gitleaks:allow — fake fixture, not a real key
+});
+
+test('I: a validate() that throws inside the four annotation-aware rules fails closed (reports the match)', () => {
+  for (const pattern of [genericSecretPattern, genericKeyPattern, azurePattern, jwtPattern]) {
+    assert.strictEqual(pattern.validate(undefined), true, `${pattern.name}: catch branch must return true`);
+    assert.strictEqual(pattern.validate(null), true, `${pattern.name}: catch branch must return true`);
+  }
+});
+
+// ── Round 8, after the second acceptance: trailing-strip ReDoS, anchored CI check ──
+test('trailing-run strips stay linear on long runs of ; , ! ? ) inside a value (ReDoS regression)', () => {
+  const n = 120000;
+  const start = Date.now();
+  detectsGeneric('PASS' + 'WORD="' + ';'.repeat(n) + '"');
+  detectsKey('API' + '_KEY="' + ','.repeat(n) + '"');
+  detectsGeneric('pass' + 'word: "' + '!?'.repeat(n / 2) + '"');
+  detectsWith(jwtPattern, JWT_NAME + '=' + ')'.repeat(n) + 'x');
+  detectsWith(azurePattern, AZ_NAME + '=' + ';'.repeat(n) + 'x');
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs < 1000, `expected near-linear scan time (<1000ms), took ${elapsedMs}ms`);
+});
+
+test('CI expression check is anchored: a fallback literal or a glued literal after ${{...}} is still judged', () => {
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + "=${{secrets.AZ||'" + FAKE_VALUE + "'}}"), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=${{secrets.AZ}}' + FAKE_VALUE), true); // gitleaks:allow — fake fixture, not a real key
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + '=${{secrets.' + AZ_NAME + '}}'), false);
+  assert.strictEqual(detectsWith(azurePattern, AZ_NAME + ': ${{ secrets.' + AZ_NAME + ' }}'), false);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
